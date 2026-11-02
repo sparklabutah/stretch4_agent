@@ -9,13 +9,27 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-# Command keys, in the order they are reported. Value units in UNITS.
+# Joint names, in the order they are reported (results, state, limits). Units in UNITS.
 JOINTS = ("drive", "slide", "turn", "lift", "arm",
           "wrist_yaw", "wrist_pitch", "wrist_roll", "gripper")
 UNITS = {"drive": "m", "slide": "m", "turn": "deg", "lift": "m", "arm": "m",
          "wrist_yaw": "deg", "wrist_pitch": "deg", "wrist_roll": "deg", "gripper": "pct"}
-# Command key -> the tool parameter the agent sees (used in error messages).
+# Command key -> the `move` argument the agent sees. The unit is part of the name, and the
+# tool schema repeats it in each argument's description, because a metres/degrees mix-up
+# moves real hardware.
 PARAM = {j: f"{j}_{u}" for j, u in UNITS.items()}
+UNIT_WORD = {"m": "metres", "deg": "degrees", "pct": "percent"}
+PARAM_DOC = {
+    "drive": "Base translation forward (+) or backward (-), in metres (0.05 = 5 cm).",
+    "slide": "Base translation sideways, in metres; + is left (unconfirmed on hardware).",
+    "turn": "Base rotation in degrees, not radians; + is counter-clockwise seen from above.",
+    "lift": "Lift height change in metres; + is up.",
+    "arm": "Arm extension change in metres (0.05 = 5 cm); + extends, - retracts.",
+    "wrist_yaw": "Wrist yaw change in degrees, not radians.",
+    "wrist_pitch": "Wrist pitch change in degrees, not radians.",
+    "wrist_roll": "Wrist roll change in degrees, not radians.",
+    "gripper": "Gripper aperture change in percent; + opens, - closes.",
+}
 BASE_KEYS = ("drive", "slide", "turn")
 # Command key -> absolute state key, for the joints that have an absolute position.
 STATE_KEY = {j: j for j in ("lift", "arm", "wrist_yaw", "wrist_pitch", "wrist_roll", "gripper")}

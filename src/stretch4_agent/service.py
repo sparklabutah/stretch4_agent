@@ -16,7 +16,7 @@ from .backends.base import Backend
 from .episode import DepthFrame, Episode, EventLog
 from .imaging import encode_jpeg
 from .safety import SafetyConfig, validate_command
-from .schema import COMPLETED, FrameTimeout, JOINTS, MotionRefused, UNITS
+from .schema import COMPLETED, PARAM, STATE_KEY, UNIT_WORD, FrameTimeout, JOINTS, MotionRefused, UNITS
 
 MAX_DEPTH_POINTS = 64
 MAX_DEPTH_CALLS = 32
@@ -30,6 +30,11 @@ def _r(x: float, n: int = 3) -> float:
 
 def _j(obj: Any) -> str:
     return json.dumps(obj, separators=(",", ":"))
+
+
+# Absolute positions in `state` and `joint_limits` use the bare joint names.
+STATE_UNITS = {**{j: UNIT_WORD[UNITS[j]] for j in STATE_KEY},
+               "base_x": "metres", "base_y": "metres", "base_theta": "degrees"}
 
 
 def operating_prompt() -> str:
@@ -119,9 +124,11 @@ class AgentService:
                 "read_only": self.cfg.safety.read_only,
                 "ready_for_motion": ready.ok and not self.cfg.safety.read_only,
                 "readiness_problems": ready.reasons(),
-                "units": UNITS,
-                "per_move_limits": self.cfg.safety.per_move,
+                # Keyed by the `move` argument name, so no other spelling is ever shown as a key.
+                "move_arguments": {PARAM[j]: {"unit": UNIT_WORD[UNITS[j]], "max_abs_per_move": self.cfg.safety.per_move[j],
+                                              "reported_as": j} for j in JOINTS},
                 "joint_limits": self._limits_doc(),
+                "state_units": STATE_UNITS,
                 "budgets": self.ep.budget.to_dict(),
                 "move_timeout_s": self.cfg.safety.move_timeout,
                 "cameras": self.backend.cameras,

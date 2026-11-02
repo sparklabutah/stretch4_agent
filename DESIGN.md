@@ -46,12 +46,18 @@ print to stdout, which corrupts an MCP stdio stream.
 `127.0.0.1:8765`, keep the protection on.
 
 - `start_episode(task: str)`: opens a log directory, resets budgets, returns the operating
-  prompt, joint limits, per-move limits, camera descriptions, budgets, read-only flag.
+  prompt, move arguments with units and per-move limits, joint limits, camera descriptions,
+  budgets, read-only flag.
   Motion is rejected before this.
 - `observe(cameras: list[str] | None = None)`: images plus state text, plus `frame_id`.
 - `move(reasoning, drive_m=0, slide_m=0, turn_deg=0, lift_m=0, arm_m=0, wrist_yaw_deg=0,
   wrist_pitch_deg=0, wrist_roll_deg=0, gripper_pct=0, return_observation=True)`: blocks until
   done; returns per-joint result and, by default, a fresh observation. All values are relative.
+  The unit is part of every argument name and the schema repeats it in each argument's
+  `description` (degrees say "not radians"), because a metres/degrees mix-up moves hardware.
+  Results, `state` and `joint_limits` use the bare joint names (`arm`); `start_episode`
+  lists the arguments as `move_arguments: {arm_m: {unit, max_abs_per_move, reported_as}}`
+  so a bare name is never shown as a key.
 - `get_gripper_depth(points: list[[x, y]], frame_id)`: up to 64 pixel coordinates **in the
   downscaled gripper image the agent saw**; returns Euclidean depth in cm or null. At most 32
   calls between moves. A stale `frame_id` is an error, since the depth would not match the image.
@@ -62,7 +68,9 @@ print to stdout, which corrupts an MCP stdio stream.
 
 Per-joint status: `completed`, `stopped_short` (with `in_collision_stop` when known; for the
 gripper this usually means a grasp), `timeout`, `rejected`. Any invalid key rejects the
-**whole** command with reasons and moves nothing.
+**whole** command with reasons and moves nothing. Every tool's schema has
+`additionalProperties: false`; an unknown name (`arm`, `arm_cm`) is rejected before the call
+runs, with the declared name and its unit in the message. Any subset of declared names is valid.
 
 Images: RGB JPEG quality 80, longest side default 768 (`--image-max-dim`). Remember the scale
 for each camera so depth queries map back to full resolution.

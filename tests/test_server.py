@@ -8,10 +8,12 @@ from mcp import Client
 from mcp.client.streamable_http import streamable_http_client
 from mcp.shared._httpx_utils import create_mcp_http_client
 from PIL import Image as PILImage
+from pydantic import ValidationError
 
 from conftest import TOKEN
 from stretch4_agent import cli
-from stretch4_agent.server import ConfigError, check_bind, create_app, require_token, token_from_env
+from stretch4_agent.schema import PARAM, UNIT_WORD, UNITS
+from stretch4_agent.server import ConfigError, build_mcp, check_bind, create_app, require_token, token_from_env
 
 INIT = {"jsonrpc": "2.0", "id": 1, "method": "initialize",
         "params": {"protocolVersion": "2025-06-18", "capabilities": {},
@@ -166,3 +168,88 @@ async def test_client_with_wrong_token_cannot_connect(live):
     with pytest.raises(Exception):
         async with client_for(url, "nope") as c:
             await c.list_tools()
+
+
+# ---- move arguments: names, units, strictness (HANDOFF open issues 1 and 2) ----------
+
+async def test_move_schema_names_the_unit_of_every_key_and_forbids_extras(live):
+    _, url = live
+    async with client_for(url) as c:
+        tools = {t.name: t for t in (await c.list_tools()).tools}
+    for t in tools.values():
+        assert t.input_schema.get("additionalProperties") is False, t.name
+    props = tools["move"].input_schema["properties"]
+    assert set(props) == {"reasoning", "return_observation", *PARAM.values()}
+    for joint, param in PARAM.items():
+        assert param.endswith("_" + UNITS[joint])
+        assert UNIT_WORD[UNITS[joint]] in props[param]["description"], param
+    for param in ("turn_deg", "wrist_yaw_deg", "wrist_pitch_deg", "wrist_roll_deg"):
+        assert "not radians" in props[param]["description"]
+
+
+async def test_subset_of_declared_keys_is_accepted_and_unknown_key_rejects_whole_call(live):
+    """Codex sent {"arm": 0.05, "reasoning": ...} and was rejected. `arm` is not a declared key
+    (`arm_m` is); any subset of declared keys must pass, and one unknown key must stop everything."""
+    service, url = live
+    async with client_for(url) as c:
+        await c.call_tool("start_episode", {"task": "t"})
+        state = lambda: service.backend.get_state()
+
+        # the exact call from the Codex run: rejected, with the right name in the message
+        before = state()
+        r = await c.call_tool("move", {"arm": 0.05, "reasoning": "extend"})
+        assert r.is_error
+        msg = r.content[0].text
+        assert "'arm' is not an argument; did you mean 'arm_m'? Its value is in metres." in msg
+        assert "nothing was done" in msg and state() == before
+
+        # wrong unit suffix: the hint names the unit so the agent converts the value
+        r = await c.call_tool("move", {"arm_cm": 5, "reasoning": "x"})
+        assert r.is_error and "did you mean 'arm_m'? Its value is in metres" in r.content[0].text
+        r = await c.call_tool("move", {"turn_rad": 0.1, "reasoning": "x"})
+        assert r.is_error and "did you mean 'turn_deg'? Its value is in degrees" in r.content[0].text
+
+        # one valid key plus one unknown key: the valid one must not move either
+        r = await c.call_tool("move", {"arm_m": 0.05, "lift": 0.05, "reasoning": "mixed"})
+        assert r.is_error and "'lift'" in r.content[0].text and state() == before
+
+        # subsets of declared keys pass: one key, then two keys plus a flag
+        r = await c.call_tool("move", {"arm_m": 0.05, "reasoning": "one key"})
+        assert not r.is_error, r.content[0].text
+        assert abs(state()["arm"] - before["arm"] - 0.05) < 1e-6
+        r = await c.call_tool("move", {"reasoning": "two keys", "lift_m": 0.02, "wrist_yaw_deg": 5.0,
+                                       "return_observation": False})
+        assert not r.is_error, r.content[0].text
+        assert set(json.loads(r.content[0].text)["results"]) == {"lift", "wrist_yaw"}
+
+        # all nine keys, as Codex resent them, also pass
+        nine = {p: 0.0 for p in PARAM.values()} | {"arm_m": -0.05}
+        r = await c.call_tool("move", {"reasoning": "nine keys", **nine, "return_observation": False})
+        assert not r.is_error, r.content[0].text
+
+        # other tools are strict too
+        r = await c.call_tool("observe", {"camera": ["gripper"]})
+        assert r.is_error and "did you mean 'cameras'" in r.content[0].text
+
+    ev = [json.loads(l) for l in (service.ep.dir / "events.jsonl").read_text().splitlines()]
+    schema = [e for e in ev if e.get("stage") == "schema"]
+    assert [sorted(e["args"]) for e in schema] == [["arm", "reasoning"], ["arm_cm", "reasoning"],
+                                                    ["reasoning", "turn_rad"], ["arm_m", "lift", "reasoning"],
+                                                    ["camera"]]
+    assert service.ep.counters["moves"] == 3
+
+
+def test_argument_models_forbid_extras_even_without_the_middleware(svc):
+    mcp = build_mcp(svc)
+    model = mcp._tool_manager.get_tool("move").fn_metadata.arg_model
+    with pytest.raises(ValidationError, match="extra_forbidden"):
+        model.model_validate({"reasoning": "x", "arm": 0.05})
+    assert model.model_validate({"reasoning": "x", "arm_m": 0.05}).arm_m == 0.05
+
+
+def test_server_refuses_to_start_if_extras_stop_being_forbidden(svc, monkeypatch):
+    """If an SDK change made the private-attribute patch a no-op, the server must not start."""
+    from mcp.server.mcpserver.utilities.func_metadata import ArgModelBase
+    monkeypatch.setattr(ArgModelBase, "model_rebuild", classmethod(lambda cls, **kw: None))
+    with pytest.raises(RuntimeError, match="would accept unknown arguments"):
+        build_mcp(svc)

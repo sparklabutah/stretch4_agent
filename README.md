@@ -176,9 +176,11 @@ Added while implementing:
   the real lease, runstop or contact behaviour.
 - Depth is a single pixel, no filtering. Base `drive`/`slide`/`turn` use odometry only: no obstacle avoidance
   beyond the robot's own guards. No absolute end-effector goals, no Nav2.
-- Invalid-argument rejections (unknown keys, wrong types) happen in the MCP layer and are logged by a small
-  middleware; extra keys are forbidden by editing the SDK's argument models, which relies on a private
-  attribute of `MCPServer`. A test covers it.
+- Invalid-argument rejections happen in the MCP layer and are logged by a small middleware. Unknown names
+  are rejected by that middleware (with the declared name and unit in the message) and, as a backstop, by
+  the SDK's argument models, which are edited through a private attribute of `MCPServer`. The server checks
+  at startup that every tool rejects an unknown argument and advertises `additionalProperties: false`, and
+  refuses to start otherwise, so an SDK upgrade cannot silently re-allow extras. Tests cover both.
 - HTTP without TLS; the loopback bind plus SSH tunnel is the security model. Images are stored in `runs/`
   and Claude Code also keeps copies under `~/.claude/projects/`.
 - The agent's `success` is a claim, never checked.

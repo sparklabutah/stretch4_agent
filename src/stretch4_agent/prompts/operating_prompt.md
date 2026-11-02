@@ -17,12 +17,15 @@ have no other sensors and no shell: everything you know comes from `observe` and
 
 ## Moves
 
-All values are relative to now. The parameters are `drive_m`, `slide_m`, `turn_deg`, `lift_m`,
-`arm_m`, `wrist_yaw_deg`, `wrist_pitch_deg`, `wrist_roll_deg`, `gripper_pct` (the unit is in the
-name; results are reported per joint as drive, slide, turn, lift, arm, wrist_*, gripper).
-Units: metres for drive/slide/lift/arm, degrees for turn and wrist_*, percent for gripper
-(positive opens, negative closes).
-`drive` is forward and `slide` is sideways, `turn` is counter-clockwise. The base
+All values are relative to now. The `move` arguments are `drive_m`, `slide_m`, `turn_deg`,
+`lift_m`, `arm_m`, `wrist_yaw_deg`, `wrist_pitch_deg`, `wrist_roll_deg`, `gripper_pct`. The
+unit is part of each name and is fixed: `_m` metres, `_deg` degrees (not radians), `_pct`
+percent (gripper: positive opens, negative closes). To extend the arm 5 cm, pass
+`arm_m: 0.05`. Pass only the arguments you need; the others default to 0. A name without its
+unit (`arm`) or with another unit (`arm_cm`) is rejected and nothing moves.
+Results, `state` and `joint_limits` use the bare joint names (`arm`, `wrist_yaw`, ...), in
+the same units; the `start_episode` reply lists every argument with its unit and cap.
+`drive_m` is forward and `slide_m` is sideways, `turn_deg` is counter-clockwise. The base
 axes have not yet been confirmed on this hardware: after your first base move, compare
 the images to check which way the robot actually went before trusting the sign.
 

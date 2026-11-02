@@ -289,3 +289,16 @@ def test_depth_needs_a_gripper_image(depth_svc):
     fid = json.loads(out[0])["frame_id"]
     with pytest.raises(MotionRefused, match="no gripper image"):
         depth_svc.get_gripper_depth([[1, 1]], fid)
+
+
+def test_start_episode_keys_move_arguments_by_their_unit_suffixed_names(svc):
+    """The reply must not present bare joint names (`arm`) as move keys: the agent copies them."""
+    from stretch4_agent.schema import PARAM, UNITS
+    info = json.loads(svc.start_episode("t")[1])
+    args = info["move_arguments"]
+    assert list(args) == list(PARAM.values())
+    assert args["arm_m"] == {"unit": "metres", "max_abs_per_move": 0.15, "reported_as": "arm"}
+    assert args["turn_deg"]["unit"] == "degrees" and args["gripper_pct"]["unit"] == "percent"
+    assert "units" not in info and "per_move_limits" not in info
+    assert set(info["joint_limits"]) <= set(info["state_units"])
+    assert set(info["state"]) == set(info["state_units"])

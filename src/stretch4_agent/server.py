@@ -5,6 +5,7 @@ print to stdout, which would corrupt an MCP stdio stream.
 """
 from __future__ import annotations
 
+import difflib
 import functools
 import hmac
 import ipaddress
@@ -13,11 +14,12 @@ from typing import Annotated
 
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
-from pydantic import Field
+from mcp.types import CallToolResult, TextContent
+from pydantic import Field, ValidationError
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-from .schema import JOINTS, MotionRefused
+from .schema import JOINTS, PARAM, PARAM_DOC, UNIT_WORD, UNITS, MotionRefused
 from .service import AgentService
 
 TOKEN_ENV = "STRETCH4_AGENT_TOKEN"
@@ -97,12 +99,18 @@ def build_mcp(service: AgentService) -> MCPServer:
 
     @mcp.tool(structured_output=False)
     @_refuse
-    def move(reasoning: str,
-             drive_m: float = 0.0, slide_m: float = 0.0, turn_deg: float = 0.0,
-             lift_m: float = 0.0, arm_m: float = 0.0,
-             wrist_yaw_deg: float = 0.0, wrist_pitch_deg: float = 0.0, wrist_roll_deg: float = 0.0,
-             gripper_pct: float = 0.0, return_observation: bool = True) -> list:
-        """One relative move; all values are deltas from now. drive_m forward, slide_m sideways (left), turn_deg counter-clockwise, lift_m up, arm_m extend, wrist_*_deg, gripper_pct (positive opens). Blocks until done. Any invalid value rejects the whole command and nothing moves. Returns per-joint results (completed / stopped_short / timeout / rejected) and by default a fresh observation."""
+    def move(reasoning: Annotated[str, Field(description="One sentence: why this move.")],
+             drive_m: Annotated[float, Field(description=PARAM_DOC["drive"])] = 0.0,
+             slide_m: Annotated[float, Field(description=PARAM_DOC["slide"])] = 0.0,
+             turn_deg: Annotated[float, Field(description=PARAM_DOC["turn"])] = 0.0,
+             lift_m: Annotated[float, Field(description=PARAM_DOC["lift"])] = 0.0,
+             arm_m: Annotated[float, Field(description=PARAM_DOC["arm"])] = 0.0,
+             wrist_yaw_deg: Annotated[float, Field(description=PARAM_DOC["wrist_yaw"])] = 0.0,
+             wrist_pitch_deg: Annotated[float, Field(description=PARAM_DOC["wrist_pitch"])] = 0.0,
+             wrist_roll_deg: Annotated[float, Field(description=PARAM_DOC["wrist_roll"])] = 0.0,
+             gripper_pct: Annotated[float, Field(description=PARAM_DOC["gripper"])] = 0.0,
+             return_observation: Annotated[bool, Field(description="Return a fresh observation after the move.")] = True) -> list:
+        """One relative move; every value is a delta from now, in the unit named by its suffix (_m metres, _deg degrees, _pct percent). Pass only the keys you need; omitted keys are 0. A key without its unit suffix (e.g. `arm`) or with another unit (e.g. `arm_cm`) is rejected. Blocks until done. Any invalid value or unknown key rejects the whole command and nothing moves. Returns per-joint results (completed / stopped_short / timeout / rejected) keyed by joint name (drive, arm, ...) and by default a fresh observation."""
         vals = dict(zip(JOINTS, (drive_m, slide_m, turn_deg, lift_m, arm_m, wrist_yaw_deg,
                                  wrist_pitch_deg, wrist_roll_deg, gripper_pct)))
         return service.move(reasoning, vals, return_observation)
@@ -126,8 +134,20 @@ def build_mcp(service: AgentService) -> MCPServer:
         """End the episode. Needs an observation taken after your last move. Your outcome is recorded as your own claim, unverified. Motion is rejected afterwards."""
         return service.finish_episode(outcome, evidence)
 
-    async def log_schema_rejections(ctx, call_next):
-        """Calls rejected by argument validation never reach the service; log them here."""
+    declared = _forbid_extra_arguments(mcp)
+
+    async def strict_arguments(ctx, call_next):
+        """Reject unknown argument names before the SDK sees them, with a message that names
+        the right key. Calls rejected by argument validation never reach the service, so both
+        kinds of schema rejection are logged here."""
+        if ctx.method == "tools/call" and ctx.params:
+            name, args = ctx.params.get("name"), ctx.params.get("arguments") or {}
+            if name in declared and isinstance(args, dict):
+                unknown = sorted(set(args) - declared[name])
+                if unknown:
+                    text = _unknown_args_message(name, unknown, declared[name])
+                    service._log(tool=name, args=args, error=text, stage="schema")
+                    return CallToolResult(content=[TextContent(type="text", text=text)], is_error=True)
         result = await call_next(ctx)
         if ctx.method == "tools/call" and ctx.params:
             blocks = getattr(result, "content", None) or (result or {}).get("content") or []
@@ -136,15 +156,60 @@ def build_mcp(service: AgentService) -> MCPServer:
                 service._log(tool=ctx.params.get("name"), args=ctx.params.get("arguments"),
                              error=text[:600], stage="schema")
         return result
-    mcp.middleware.append(log_schema_rejections)
+    mcp.middleware.append(strict_arguments)
+    return mcp
 
-    # Pydantic ignores unknown keys by default, which would silently drop a typo such as
-    # `arm_cm` and move something else. Forbid extras so the whole call fails instead.
+
+def _forbid_extra_arguments(mcp: MCPServer) -> dict[str, set[str]]:
+    """Make every tool reject unknown argument names, and say so in its advertised schema.
+
+    Pydantic ignores unknown keys by default, which would silently drop a typo such as
+    `arm_cm` and move the rest. The SDK has no public switch for this, so the argument models
+    are edited through the private `_tool_manager`; the self-check below makes the server
+    refuse to start if an SDK change stops that from working. Returns the declared names.
+    """
+    declared: dict[str, set[str]] = {}
     for tool in mcp._tool_manager.list_tools():
         model = tool.fn_metadata.arg_model
         model.model_config["extra"] = "forbid"
         model.model_rebuild(force=True)
-    return mcp
+        tool.parameters = model.model_json_schema(by_alias=True)   # now has additionalProperties: false
+        probe = "__stretch4_agent_probe__"
+        try:
+            model.model_validate({probe: 0})
+            rejected = False
+        except ValidationError as e:
+            rejected = any(err["type"] == "extra_forbidden" for err in e.errors())
+        if not rejected or tool.parameters.get("additionalProperties") is not False:
+            raise RuntimeError(f"tool {tool.name!r} would accept unknown arguments; the mcp SDK changed. "
+                               "Refusing to start.")
+        declared[tool.name] = set(tool.parameters.get("properties", {}))
+    return declared
+
+
+def _suggest(key: str, declared: set[str]) -> str | None:
+    k = key.strip().lower()
+    for joint in sorted(JOINTS, key=len, reverse=True):     # `arm`, `arm_cm`, `turn_rad`, ...
+        if (k == joint or k.startswith(joint + "_")) and PARAM[joint] in declared:
+            return PARAM[joint]
+    close = difflib.get_close_matches(k, sorted(declared), n=1, cutoff=0.7)
+    return close[0] if close else None
+
+
+def _unknown_args_message(tool: str, unknown: list[str], declared: set[str]) -> str:
+    unit_of = {PARAM[j]: UNIT_WORD[UNITS[j]] for j in JOINTS}
+    parts = []
+    for key in unknown:
+        hint = _suggest(key, declared)
+        if hint in unit_of:
+            parts.append(f"{key!r} is not an argument; did you mean {hint!r}? Its value is in {unit_of[hint]}.")
+        elif hint:
+            parts.append(f"{key!r} is not an argument; did you mean {hint!r}?")
+        else:
+            parts.append(f"{key!r} is not an argument.")
+    order = [p for p in ("reasoning", *PARAM.values()) if p in declared] + sorted(declared - {"reasoning", *PARAM.values()})
+    return (f"{tool} rejected, nothing was done: " + " ".join(parts) +
+            f" Unknown argument names reject the whole call. Accepted: {', '.join(order)}.")
 
 
 def create_app(service: AgentService, token: str, host: str = "127.0.0.1") -> ASGIApp:
