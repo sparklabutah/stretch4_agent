@@ -22,6 +22,10 @@ WRIST = ("wrist_yaw", "wrist_pitch", "wrist_roll")
 # How close achieved must be to requested to call it completed (agent units).
 TOL = {"drive": 0.02, "slide": 0.02, "turn": 2.0, "lift": 0.005, "arm": 0.005,
        "wrist_yaw": 2.0, "wrist_pitch": 2.0, "wrist_roll": 2.0, "gripper": 3.0}
+# The only tool joint whose commands are in percent: the server's StretchGripper.move_by(delta_pct).
+# Other tools take other units (ParallelGripper.move_by takes aperture metres), so they are not
+# exposed as `gripper` at all, and gripper moves are refused rather than sent in the wrong unit.
+GRIPPER_JOINT = "stretch_gripper"
 # Used only if the gripper's command range cannot be read from the tool metadata.
 GRIPPER_FALLBACK = (-100.0, 50.0)
 LEASE_NOTE = ("no motion was observed. If the command was valid, another RobotClient may hold the "
@@ -33,12 +37,24 @@ def _wrap_deg(a: float) -> float:
     return (a + 180.0) % 360.0 - 180.0
 
 
+def _pair(v: Any) -> tuple[float, float] | None:
+    """A (min, max) limit from status or params, or None when missing or not yet known.
+    `status[joint]['soft_motion_limits']` is a plain [min, max] list (PrismaticJoint and
+    FeetechSMHello both store `soft_motion_limits['current']` there); unhomed wrist joints
+    report [None, None]."""
+    try:
+        lo, hi = (float(x) for x in v)
+    except (TypeError, ValueError):
+        return None
+    return (lo, hi) if math.isfinite(lo) and math.isfinite(hi) and lo < hi else None
+
+
 class StretchBackend:
     name = "stretch"
     cameras = {
         "head_left": "head camera, left, rotated upright by the camera pipeline",
-        "head_right": "head camera, right",
-        "head_center": "head camera, centre, high resolution wide view",
+        "head_right": "head camera, right, rotated upright by the camera pipeline",
+        "head_center": "head camera, centre, high resolution wide view, rotated upright by the camera pipeline",
         "gripper": "gripper RGBD camera (right imager); depth is aligned to this image",
     }
 
@@ -62,7 +78,9 @@ class StretchBackend:
         self._cam_lock = threading.Lock()
         self.joints: list[str] = []
         self.gripper_joint: str | None = None
-        self._limits: dict[str, tuple[float, float]] = {}
+        self.unsupported_tool_joints: list[str] = []
+        self._gripper_limits: tuple[float, float] | None = None
+        self.depth_problem: str | None = None
 
     # ------------------------------------------------------------------ lifecycle
     def start(self) -> None:
@@ -85,9 +103,11 @@ class StretchBackend:
         if not self.robot.startup():           # returns False on failure; the `with` form would yield None
             raise RuntimeError("RobotClient.startup() failed: is `stretch_body_server` running on this machine?")
         self.joints = list(self.robot.end_of_arm.joints)    # depends on the attached tool: never hardcode
-        self.gripper_joint = next((j for j in self.joints if j not in WRIST), None)
+        self.gripper_joint = GRIPPER_JOINT if GRIPPER_JOINT in self.joints else None
+        self.unsupported_tool_joints = [j for j in self.joints if j not in WRIST and j != GRIPPER_JOINT]
+        if self.gripper_joint:
+            self._gripper_limits = self._gripper_range()
         self._pull()
-        self._limits = self._discover_limits()
         for key, factory in (("head", self._head_stream), ("gripper", self._gripper_stream)):
             threading.Thread(target=self._camera_loop, args=(key, factory), daemon=True, name=f"cam-{key}").start()
 
@@ -106,6 +126,10 @@ class StretchBackend:
                 if self._stop.is_set():
                     return
                 if fr is None:
+                    continue
+                if key == "gripper" and not getattr(getattr(fr, "right", None), "timestamp", 0):
+                    # The gripper adapter substitutes a black ImageFrame(timestamp=0) when the right
+                    # image is missing from a sync group; never show that as a fresh observation.
                     continue
                 with self._cam_lock:
                     self._latest[key] = (time.time(), fr)   # our clock, so freshness compares with motion end
@@ -135,9 +159,8 @@ class StretchBackend:
         for j in WRIST:
             if j in eoa:
                 out[j] = math.degrees(eoa[j]["pos"])
-        if self.gripper_joint and self.gripper_joint in eoa:
-            g = eoa[self.gripper_joint]
-            out["gripper"] = g.get("pos_pct", g["pos"])   # the gripper reports pct; other tools only pos
+        if self.gripper_joint and "pos_pct" in eoa.get(self.gripper_joint, {}):
+            out["gripper"] = eoa[self.gripper_joint]["pos_pct"]   # never fall back to `pos` (radians)
         return out
 
     def get_state(self) -> dict[str, float]:
@@ -145,26 +168,37 @@ class StretchBackend:
             self._pull()
             return self._state_locked()
 
-    def _discover_limits(self) -> dict[str, tuple[float, float]]:
+    def _limits_locked(self) -> dict[str, tuple[float, float]]:
+        """Read from status each time: soft limits change at runtime and are unknown until homed.
+        A joint without a readable limit is left out, so the safety layer refuses to move it."""
         st = self._status()
-        lim = {}
+        lim: dict[str, tuple[float, float]] = {}
         for j in ("lift", "arm"):
-            lo, hi = st[j]["soft_motion_limits"]["current"]
-            lim[j] = (float(lo), float(hi))
+            p = _pair(st[j].get("soft_motion_limits"))
+            if p:
+                lim[j] = p
+        eoa = st.get("end_of_arm", {})
         params = getattr(self.robot, "robot_params", {}) or {}
         for j in WRIST:
-            if j in self.joints:
-                rng = (params.get(j) or {}).get("range_deg")
-                if rng:   # a joint without a readable range is left out, so moving it is refused
-                    lim[j] = (float(rng[0]), float(rng[1]))
-        if self.gripper_joint:
-            lim["gripper"] = self._gripper_range()
+            if j not in self.joints:
+                continue
+            p = _pair(eoa.get(j, {}).get("soft_motion_limits"))   # radians, padded, what the server clips to
+            if p:
+                lim[j] = (math.degrees(p[0]), math.degrees(p[1]))
+                continue
+            jp = params.get(j) or {}
+            p = _pair(jp.get("range_deg"))       # the same numbers before padding, from the joint's device params
+            if p:
+                pad = jp.get("range_pad_deg") or (0.0, 0.0)
+                lim[j] = (p[0] + abs(float(pad[0])), p[1] - abs(float(pad[1])))
+        if self._gripper_limits and "pos_pct" in eoa.get(self.gripper_joint, {}):
+            lim["gripper"] = self._gripper_limits
         return lim
 
     def _gripper_range(self) -> tuple[float, float]:
         try:
             from stretch4_body.utils.tool_metadata import get_tool_metadata
-            lo, hi = get_tool_metadata(self.gripper_joint).command_range
+            lo, hi = get_tool_metadata(self.gripper_joint).command_range   # percent for StretchGripper
             return float(lo), float(hi)
         except Exception:
             return GRIPPER_FALLBACK
@@ -172,11 +206,7 @@ class StretchBackend:
     def get_limits(self) -> dict[str, tuple[float, float]]:
         with self._lock:
             self._pull()
-            lim = dict(self._limits)   # lift/arm soft limits can change at runtime: re-read
-            for j in ("lift", "arm"):
-                a, b = self._status()[j]["soft_motion_limits"]["current"]
-                lim[j] = (float(a), float(b))
-            return lim
+            return self._limits_locked()
 
     def readiness(self) -> Readiness:
         problems = [f"camera stream {k} stopped: {e}" for k, e in self._cam_err.items()]
@@ -405,7 +435,14 @@ class StretchBackend:
         if depth is None:
             return None
         d = np.asarray(depth, dtype=np.float32) * self.depth_scale_to_m
-        if d.shape != shape:   # nearest-neighbour onto the RGB grid; only if the pipeline did not align sizes
+        if d.shape != shape:
+            # The pipeline rotates/crops only the colour image, never the depth map. Resample only a
+            # pure scale difference; any other mismatch would give depth at the wrong pixel.
+            if abs(d.shape[0] / d.shape[1] - shape[0] / shape[1]) > 0.01:
+                self.depth_problem = (f"depth {d.shape} does not match the gripper image {shape} up to scale "
+                                      "(rotated or cropped image?); depth withheld")
+                return None
+            # nearest-neighbour onto the RGB grid
             ys = (np.arange(shape[0]) * d.shape[0] / shape[0]).astype(int)
             xs = (np.arange(shape[1]) * d.shape[1] / shape[1]).astype(int)
             d = d[ys][:, xs]
@@ -422,6 +459,7 @@ class StretchBackend:
             out["status_keys"] = sorted(st.keys())
             out["end_of_arm_joints"] = self.joints
             out["gripper_joint"] = self.gripper_joint
+            out["unsupported_tool_joints"] = self.unsupported_tool_joints   # not commandable: units are not percent
             out["state"] = self._state_locked()
             out["omnibase_status_keys"] = sorted(st["omnibase"].keys())
             out["is_homed"], out["is_runstopped"] = self.robot.is_homed(), self.robot.is_runstopped()
@@ -444,5 +482,6 @@ class StretchBackend:
                                         "assumed_unit": "millimetres, scaled by %g" % self.depth_scale_to_m}
         except FrameTimeout as e:
             cams["frames"] = f"unavailable: {e}"
+        cams["depth_problem"] = self.depth_problem
         out["cameras"] = cams
         return out

@@ -118,7 +118,9 @@ backends never need it. Source facts to honour:
 
 - `RobotClient()`; `startup()` returns False on failure; `with` yields None on failure.
 - Status: `robot.pull_status()`; `robot.status['lift'|'arm']['pos']`,
-  `['in_collision_stop']`, `['soft_motion_limits']['current']`;
+  `['in_collision_stop']`, `['soft_motion_limits']` (a plain `[min, max]` list, the joint's
+  `soft_motion_limits['current']`; wrist joints publish the same in radians, `[None, None]`
+  until homed);
   `robot.status['omnibase']['x','y','theta']`;
   `robot.status['end_of_arm'][joint]['pos']`; gripper uses `pos_pct`.
 - Commands: `robot.lift.move_by(m)`, `robot.arm.move_by(m)`,
@@ -137,10 +139,18 @@ backends never need it. Source facts to honour:
 - `robot.wait_on_motion_finish(names, timeout)` does not report whether it timed out (the
   bool from `_wait_on_status` is dropped), so poll `is_moving` yourself.
 - Tool may vary: check `robot.end_of_arm.joints` / `is_tool_present`; do not hardcode.
+  Only the `stretch_gripper` joint takes percent; `parallel_gripper` takes aperture metres
+  (`ParallelGripper.move_by(x_m)`). The backend exposes `gripper` only for `stretch_gripper`
+  and refuses gripper moves on any other tool rather than send a value in the wrong unit.
+- `RobotClient.stop()` calls each subsystem's `stop()`: the base goes to freewheel and lift/arm
+  to `enable_safety`, pushed with `ignore_control_lock=True`.
 - Cameras: run generators in daemon threads keeping the latest frame.
   `stream_left_right_center_camera_compressed()` gives `.left/.right/.center`, BGR after the
   default decode. `stream_gripper_camera_compressed()` gives `.right` and `.depth`; depth is
   aligned to the **right** gripper camera (`setDepthAlign`), so that is the gripper image.
+  The pipeline rotates and crops only colour images (head cameras rotate by default, the
+  gripper does not), never depth; depth is resampled only for a pure scale difference. A
+  missing right image arrives as a black `ImageFrame(timestamp=0)` and is skipped.
 - Convert BGR to RGB. Freshness: wait for a frame newer than motion end, up to 5 s, else error.
 
 `stretch4-agent doctor --backend stretch` prints status keys, limits, camera shapes and rates

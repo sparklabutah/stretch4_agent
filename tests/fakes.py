@@ -32,20 +32,27 @@ class FakeRobot:
         self.started = False
         self.stopped = False
         self.warnings = []
-        self.robot_params = {"wrist_yaw": {"range_deg": [-90, 180]}, "wrist_pitch": {"range_deg": [-90, 20]},
-                             "wrist_roll": {"range_deg": [-90, 90]}}
+        # Device params land at robot_params[joint] (core/robot_params.py expands 'device_params').
+        self.robot_params = {"wrist_yaw": {"range_deg": [-90, 180], "range_pad_deg": [0.0, 0.0]},
+                             "wrist_pitch": {"range_deg": [-90, 20], "range_pad_deg": [0.0, 0.0]},
+                             "wrist_roll": {"range_deg": [-90, 90], "range_pad_deg": [0.0, 0.0]}}
         self.status = {
             "lift": {"pos": 0.5, "motor": {"pos_calibrated": True, "is_mg_moving": False},
                      "in_collision_stop": {"pos": False, "neg": False},
-                     "soft_motion_limits": {"current": [0.0, 1.1]}},
+                     "soft_motion_limits": [0.0, 1.1]},
             "arm": {"pos": 0.1, "motor": {"pos_calibrated": True, "is_mg_moving": False},
                     "in_collision_stop": {"pos": False, "neg": False},
-                    "soft_motion_limits": {"current": [0.0, 0.52]}},
+                    "soft_motion_limits": [0.0, 0.52]},
             "omnibase": {"x": 0.0, "y": 0.0, "theta": 0.0,
                          **{f"wheel_{i}": {"is_mg_moving": False} for i in range(3)}},
             "end_of_arm": {j: {"pos": 0.0, "is_moving": False, "pos_calibrated": homed} for j in tool_joints},
             "power_periph": {"runstop_event": runstopped},
         }
+        # FeetechSMHello publishes soft_motion_limits as [min, max] radians, [None, None] until homed.
+        for j, prm in self.robot_params.items():
+            if j in tool_joints:
+                self.status["end_of_arm"][j]["soft_motion_limits"] = (
+                    [math.radians(v) for v in prm["range_deg"]] if homed else [None, None])
         if "stretch_gripper" in tool_joints:
             self.status["end_of_arm"]["stretch_gripper"]["pos_pct"] = 0.0
         self.end_of_arm = SimpleNamespace(joints=list(tool_joints), move_by=self._eoa_move_by,
@@ -191,13 +198,18 @@ def head_stream(period=0.01, fail_after=None):
     return gen
 
 
-def gripper_stream(period=0.01, depth_shape=(24, 32), depth_mm=640):
-    """Yields frames with .right.image (BGR) and .depth (uint16 millimetres, aligned to the right image)."""
+def gripper_stream(period=0.01, depth_shape=(24, 32), depth_mm=640, placeholder_only=False):
+    """Yields frames with .right.image (BGR) and .depth (uint16 millimetres, aligned to the right image).
+    placeholder_only: every frame carries the adapter's stand-in for a missing right image
+    (black, timestamp=0; luxonis_gripper_camera_adapter.py)."""
     def gen():
         while True:
             depth = np.full(depth_shape, depth_mm, np.uint16)
             depth[0, 0] = 0   # no stereo match
-            right = SimpleNamespace(image=_img(48, 64, (0, 128, 255)), timestamp=time.time(), frame_number=1)
+            if placeholder_only:
+                right = SimpleNamespace(image=_img(48, 64, (0, 0, 0)), timestamp=0, frame_number=0)
+            else:
+                right = SimpleNamespace(image=_img(48, 64, (0, 128, 255)), timestamp=time.time(), frame_number=1)
             yield SimpleNamespace(timestamp=time.time(), left=right, right=right, center=None, depth=depth)
             time.sleep(period)
     return gen

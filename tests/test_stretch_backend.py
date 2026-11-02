@@ -13,12 +13,12 @@ from stretch4_agent.backends.stretch import StretchBackend
 from stretch4_agent.schema import FrameTimeout, MotionRefused
 
 
-def make(robot=None, **kw):
+def make(robot=None, gstream=None, wait=2, **kw):
     robot = robot or FakeRobot()
-    be = StretchBackend(robot_factory=lambda: robot, head_stream=head_stream(), gripper_stream=gripper_stream(),
+    be = StretchBackend(robot_factory=lambda: robot, head_stream=head_stream(), gripper_stream=gstream or gripper_stream(),
                         poll_s=0.005, start_grace_s=0.15, **kw)
     be.start()
-    t_end = time.time() + 2
+    t_end = time.time() + wait
     while not be.readiness().ok and time.time() < t_end:
         time.sleep(0.01)
     return be, robot
@@ -321,5 +321,79 @@ def test_doctor_reports_without_commanding_anything():
         assert "lift" in d["status_keys"] and d["gripper_joint"] == "stretch_gripper"
         assert d["cameras"]["head_fps"] > 0 and d["cameras"]["gripper"]["depth"]["valid_fraction"] > 0.9
         assert r.pushes_attempted == 0
+    finally:
+        b.close()
+
+
+# ---- mismatches found reviewing against the stretch4_body source (2026-11-02) ------------
+
+def test_soft_motion_limits_are_a_plain_list_and_unknown_limits_refuse_motion(tmp_path):
+    """status[joint]['soft_motion_limits'] is [min, max] (PrismaticJoint.__update_status), not
+    {'current': [...]}; reading it as a dict crashed start() before this was fixed."""
+    r = FakeRobot()
+    r.status["arm"]["soft_motion_limits"] = [None, None]
+    b, _ = make(r)
+    try:
+        assert b.get_limits()["lift"] == (0.0, 1.1) and "arm" not in b.get_limits()
+        svc = make_service(tmp_path, backend=b)
+        svc.start_episode("t")
+        with pytest.raises(MotionRefused, match="no readable limits for arm"):
+            svc.move("r", {"arm": 0.01})
+        assert r.push_log == []
+    finally:
+        b.close()
+
+
+def test_wrist_limits_come_from_status_soft_limits_then_padded_params():
+    r = FakeRobot()
+    r.status["end_of_arm"]["wrist_yaw"]["soft_motion_limits"] = [math.radians(-64), math.radians(244)]
+    r.status["end_of_arm"]["wrist_pitch"]["soft_motion_limits"] = [None, None]     # not known: use params
+    r.robot_params["wrist_pitch"] = {"range_deg": [-90, 20], "range_pad_deg": [1.0, 1.0]}
+    del r.status["end_of_arm"]["wrist_roll"]["soft_motion_limits"]
+    r.robot_params["wrist_roll"] = {}                                              # nothing readable
+    b, _ = make(r)
+    try:
+        lim = b.get_limits()
+        assert lim["wrist_yaw"] == pytest.approx((-64.0, 244.0))
+        assert lim["wrist_pitch"] == pytest.approx((-89.0, 19.0))
+        assert "wrist_roll" not in lim
+    finally:
+        b.close()
+
+
+def test_a_tool_that_is_not_the_percent_gripper_is_never_commanded_as_gripper(tmp_path):
+    """ParallelGripper.move_by takes aperture metres; sending gripper_pct there would be a unit error."""
+    r = FakeRobot(tool_joints=("wrist_yaw", "wrist_pitch", "wrist_roll", "parallel_gripper"))
+    b, _ = make(r)
+    try:
+        assert b.gripper_joint is None and b.unsupported_tool_joints == ["parallel_gripper"]
+        assert "gripper" not in b.get_limits() and "gripper" not in b.get_state()
+        svc = make_service(tmp_path, backend=b)
+        svc.start_episode("t")
+        with pytest.raises(MotionRefused, match="no readable limits for gripper"):
+            svc.move("r", {"gripper": 10.0})
+        assert r.push_log == []
+        assert json.loads(svc.move("r", {"wrist_yaw": 5.0}, return_observation=False)[0])["all_completed"]
+        assert b.doctor()["unsupported_tool_joints"] == ["parallel_gripper"]
+    finally:
+        b.close()
+
+
+def test_gripper_placeholder_frames_are_never_served():
+    b, _ = make(gstream=gripper_stream(placeholder_only=True), wait=0.3)
+    try:
+        assert "no frames yet from the gripper camera stream" in b.readiness().problems
+        with pytest.raises(FrameTimeout):
+            b.get_frames(None, 0.2, ["gripper"])
+        assert b.get_frames(None, 1.0, ["head_left"])["head_left"].rgb.shape == (40, 64, 3)
+    finally:
+        b.close()
+
+
+def test_depth_that_does_not_match_the_image_up_to_scale_is_withheld():
+    b, _ = make(gstream=gripper_stream(depth_shape=(64, 48)))      # image is 48x64: rotated, not scaled
+    try:
+        f = b.get_frames(None, 1.0, ["gripper"])["gripper"]
+        assert f.depth is None and "does not match" in b.depth_problem
     finally:
         b.close()

@@ -8,7 +8,7 @@ bearer token), three interchangeable backends. Design and rationale: [DESIGN.md]
 | Backend | What it is | Status |
 |---|---|---|
 | `mock` | NumPy ray-cast room, kinematic robot, consistent depth | Tested. Runs anywhere |
-| `sim` | `stretch4_mujoco`, headless MuJoCo | Run end to end on macOS (see Quick start) |
+| `sim` | `stretch4_mujoco`, headless MuJoCo | Run end to end on macOS, and on headless Linux with software EGL (see Quick start) |
 | `stretch` | Real robot via `RobotClient` + camera generators | **Only ever exercised against a fake `RobotClient` and fake camera generators written from the source. No hardware has touched it.** |
 
 ## Quick start
@@ -35,7 +35,9 @@ git clone https://github.com/hello-robot/stretch4_mujoco --recurse-submodules
 
 Headless is the default and works with plain `python` on macOS. A viewer (`--viewer`) needs the
 child process started by `mjpython` on macOS (`.venv/bin/mjpython -m stretch4_agent.cli serve
---backend sim --viewer`); that path is untested here. On Linux set `MUJOCO_GL=egl` for GPU rendering.
+--backend sim --viewer`); that path is untested here. On Linux set `MUJOCO_GL=egl`. A machine with no GPU
+also needs Mesa's EGL (on Ubuntu: `apt-get install libegl1 libegl-mesa0 libgl1-mesa-dri`), which renders in
+software; without it MuJoCo fails with `'NoneType' object has no attribute 'eglQueryString'`.
 
 ## Using it from an agent
 
@@ -68,6 +70,11 @@ What was observed on this Mac against `mock` (one run each, tiny task): Claude C
 `--model haiku` called `start_episode`, `observe`, `move`, `finish_episode`, and its answer named the
 coloured boxes, which appear only in the images. Codex 0.163 with `gpt-6.1-sol` did the same, and also
 used `get_gripper_depth`. In both, the tool results contained four JPEG image blocks.
+
+Against `sim` on headless Linux (one run, 2026-11-02): Claude Code 2.1.316 with `--model haiku` called
+`start_episode`, `observe`, `move` with `{"arm_m": 0.05}` and `finish_episode`; `events.jsonl` records the
+four calls with no errors and the arm achieving 4.94 cm. In the saved head-centre images the gripper sits
+further out after the move. The `success` outcome is the agent's claim.
 
 ## Moving to a workstation
 
@@ -141,9 +148,14 @@ From DESIGN.md:
 
 Added while implementing:
 
-7. Wrist joint limits are read from `robot.robot_params[joint]['range_deg']`; the path and the frame those
-   degrees are in are guesses. A joint where this fails has no limits and is refused.
-8. Gripper limits come from `get_tool_metadata(joint).command_range`, falling back to (-100, 50) pct.
+7. Wrist joint limits come from `status['end_of_arm'][joint]['soft_motion_limits']` (radians, padded; what the
+   server clips to in `FeetechSMHello`), falling back to `robot_params[joint]['range_deg']` minus
+   `range_pad_deg`. Unverified: that the client status carries those limits, and that they are in the same
+   frame as `status[joint]['pos']`. A joint with neither has no limits and is refused.
+8. Gripper limits come from `get_tool_metadata('stretch_gripper').command_range` (percent), falling back to
+   (-100, 50). Only the `stretch_gripper` tool is commandable as `gripper`; with any other tool (for example
+   `parallel_gripper`, which takes metres) gripper moves are refused and `doctor` lists the joint under
+   `unsupported_tool_joints`.
 9. Timeout stop primitives: `lift/arm.set_velocity(0)`, `omnibase.hard_stop()`, `end_of_arm.quick_stop(joint)`.
 10. Status paths used for motion detection (`status['omnibase']['wheel_N']['is_mg_moving']`,
     `status['end_of_arm'][joint]['is_moving']`), and `in_collision_stop` on wrist and gripper. The base uses
@@ -155,6 +167,17 @@ Added while implementing:
     Euclidean). Converting needs intrinsics, which this prototype does not use.
 13. `RobotClient.pull_status(blocking=False)` returning False means "no new status"; polled for up to 1 s.
 14. Frame freshness uses the time our thread received the frame, not the camera timestamp.
+
+Added after reviewing against the `stretch4_body` source (commit 282e31c, 2026-10-30):
+
+15. `status['lift'|'arm']['soft_motion_limits']` is read as a plain `[min, max]` list, as `PrismaticJoint`
+    stores it. The earlier code read `['current']` from it, which would have raised `TypeError` in `start()`.
+16. Closing the server calls `RobotClient.stop()`, which per the source leaves the base in **freewheel** and
+    lift/arm in safety mode. Check what that means on a slope before relying on it.
+17. Gripper frames whose right image is the adapter's placeholder (`timestamp == 0`) are skipped. Real frames
+    are assumed to carry a non-zero device timestamp.
+18. Depth that does not match the gripper image up to scale is withheld (`doctor` shows `depth_problem`)
+    rather than stretched. With the default configs the gripper image is not rotated, so this should not fire.
 
 ## Known limitations
 
