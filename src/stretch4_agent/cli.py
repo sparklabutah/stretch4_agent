@@ -25,8 +25,11 @@ def _build_service(args):
         v = getattr(args, f"max_{key}", None)
         if v is not None:
             per_move[key] = v
-    safety = SafetyConfig(per_move=per_move, max_moves=args.max_moves, max_seconds=args.max_minutes * 60,
-                          move_timeout=args.move_timeout, read_only=args.read_only)
+    try:
+        safety = SafetyConfig(per_move=per_move, max_moves=args.max_moves, max_seconds=args.max_minutes * 60,
+                              move_timeout=args.move_timeout, read_only=args.read_only)
+    except ValueError as e:
+        raise ConfigError(str(e)) from None
     cfg = ServiceConfig(safety=safety, runs_dir=Path(args.runs_dir), image_max_dim=args.image_max_dim)
     backend = make_backend(args.backend, **kw)
     return AgentService(backend, cfg), backend
@@ -39,7 +42,11 @@ def cmd_serve(args) -> int:
     except ConfigError as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
-    service, backend = _build_service(args)
+    try:
+        service, backend = _build_service(args)
+    except ConfigError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
     backend.start()
     print(f"stretch4-agent: backend={args.backend} read_only={args.read_only} "
           f"http://{args.host}:{args.port}/mcp", file=sys.stderr, flush=True)
@@ -49,7 +56,11 @@ def cmd_serve(args) -> int:
 
 def cmd_doctor(args) -> int:
     args.read_only = True
-    service, backend = _build_service(args)
+    try:
+        service, backend = _build_service(args)
+    except ConfigError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
     backend.start()
     try:
         print(json.dumps(backend.doctor(), indent=2, default=str))

@@ -129,8 +129,9 @@ head runstop button for every stage after 1.
 5. **Failure paths, still tiny caps.** Start `stretch_gamepad_teleop` or another RobotClient: expect
    `rejected` ("control lock") or `stopped_short` with the lease note, and the server still alive. Set
    `--move-timeout 1` and command a slow move: expect `timeout` and the motion halted. Call
-   `emergency_stop` mid-move: expect the robot to stop and refuse motion until a person clears the runstop
-   (and re-homes if the robot requires it).
+   `emergency_stop` mid-move: expect the robot to stop and the runstop to latch. The server refuses motion
+   until it is restarted, even if the runstop did not latch; check both. A person clears the runstop
+   (and re-homes if the robot requires it), then restarts the server.
 6. **Combined moves, then full episodes** with default caps, a person watching, a task that cannot hurt
    anything. Watch `events.jsonl` timings.
 
@@ -192,8 +193,8 @@ Added after reviewing against the `stretch4_body` source (commit 282e31c, 2026-1
   matters, run agents as an unprivileged user in a container. Claude Code is restricted to the MCP server
   by `--tools ""` and `--allowedTools`.
 - Single client, single episode at a time. `start_episode` abandons an active one.
-- `emergency_stop` is latched by the backend (mock/sim: until the server restarts; real: until a person
-  clears the runstop). There is no tool to clear it, by design.
+- `emergency_stop` latches in the server until it is restarted, on every backend, in addition to the real
+  robot's runstop. There is no tool to clear either, by design.
 - The mock is geometry, not physics. The sim's head cameras are fisheye and rotated, its wrist limits are the
   simulator's generic ones, and its gripper percent is a linear rescale of the aperture. Neither reproduces
   the real lease, runstop or contact behaviour.

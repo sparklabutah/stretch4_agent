@@ -5,6 +5,7 @@ import json
 import math
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from importlib import resources
 from pathlib import Path
@@ -53,7 +54,10 @@ class AgentService:
     def __init__(self, backend: Backend, cfg: ServiceConfig, clock: Callable[[], float] = time.monotonic):
         self.backend, self.cfg, self.clock = backend, cfg, clock
         self.ep: Episode | None = None
-        self._move_lock = threading.Lock()
+        # One tool body at a time (emergency_stop excepted): an observe running beside a move could
+        # otherwise mark mid-motion images as the fresh observation that finish_episode relies on.
+        self._busy = threading.Lock()
+        self._estop_reason: str | None = None   # latched by emergency_stop until the server restarts
         self._server_log: EventLog | None = None
         self._last_result_t: float | None = None
         self._boot_ts = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
@@ -91,6 +95,20 @@ class AgentService:
             if self.ep is not None:
                 self.ep.write_summary()
 
+    @contextmanager
+    def _exclusive(self, *, wait: bool):
+        if wait:
+            ok = self._busy.acquire(timeout=self.cfg.safety.move_timeout + FRAME_WAIT_S + 5.0)
+        else:
+            ok = self._busy.acquire(blocking=False)
+        if not ok:
+            raise MotionRefused("another tool call (a move?) is still running; call tools one at a time"
+                                if not wait else "timed out waiting for a running move to finish")
+        try:
+            yield
+        finally:
+            self._busy.release()
+
     def _note(self, **kw: Any) -> None:
         """Attach result details to the event being logged."""
         self._tl.extra = {**getattr(self._tl, "extra", {}), **kw}
@@ -110,6 +128,10 @@ class AgentService:
     # ------------------------------------------------------------ start / end
     def start_episode(self, task: str) -> list:
         def body() -> list:
+            with self._exclusive(wait=True):
+                return start()
+
+        def start() -> list:
             if not task.strip():
                 raise MotionRefused("task must be a non-empty string")
             if self.ep is not None and self.ep.active:
@@ -122,8 +144,8 @@ class AgentService:
             info = {
                 "episode": self.ep.id,
                 "read_only": self.cfg.safety.read_only,
-                "ready_for_motion": ready.ok and not self.cfg.safety.read_only,
-                "readiness_problems": ready.reasons(),
+                "ready_for_motion": ready.ok and not self.cfg.safety.read_only and self._estop_reason is None,
+                "readiness_problems": ready.reasons() + ([self._estop_message()] if self._estop_reason is not None else []),
                 # Keyed by the `move` argument name, so no other spelling is ever shown as a key.
                 "move_arguments": {PARAM[j]: {"unit": UNIT_WORD[UNITS[j]], "max_abs_per_move": self.cfg.safety.per_move[j],
                                               "reported_as": j} for j in JOINTS},
@@ -140,6 +162,10 @@ class AgentService:
 
     def finish_episode(self, outcome: str, evidence: str) -> list:
         def body() -> list:
+            with self._exclusive(wait=True):
+                return finish()
+
+        def finish() -> list:
             ep = self._require_active()
             if outcome not in OUTCOMES:
                 raise MotionRefused(f"outcome must be one of {OUTCOMES}")
@@ -158,8 +184,8 @@ class AgentService:
     # --------------------------------------------------------------- observe
     def observe(self, cameras: list[str] | None = None) -> list:
         def body() -> list:
-            ep = self._require_active()
-            return self._observe(ep, cameras)
+            with self._exclusive(wait=True):    # waits for a running move, then sees its result
+                return self._observe(self._require_active(), cameras)
         return self.logged("observe", {"cameras": cameras}, body)
 
     def _observe(self, ep: Episode, cameras: list[str] | None) -> list:
@@ -199,16 +225,16 @@ class AgentService:
         args = {"reasoning": reasoning, **command, "return_observation": return_observation}
 
         def body() -> list:
-            ep = self._require_active()
-            try:
-                deltas = self._check_motion_allowed(ep, command)
-            except MotionRefused as e:
-                ep.counters["moves_rejected"] += 1
-                self._note(rejected=str(e))
-                raise
-            if not self._move_lock.acquire(blocking=False):
-                raise MotionRefused("another move is still running")
-            try:
+            # Not queued: a move sent while another call runs is refused. Validation happens inside
+            # the lock, so the limits are checked against the state the move actually starts from.
+            with self._exclusive(wait=False):
+                ep = self._require_active()
+                try:
+                    deltas = self._check_motion_allowed(ep, command)
+                except MotionRefused as e:
+                    ep.counters["moves_rejected"] += 1
+                    self._note(rejected=str(e))
+                    raise
                 before = self._state()
                 t_exec = time.monotonic()
                 try:
@@ -219,27 +245,31 @@ class AgentService:
                     ep.budget.moves += 1
                     self._after_motion(ep)
                     raise MotionRefused(f"backend error during move, robot halted: {type(e).__name__}: {e}") from e
-            finally:
-                self._move_lock.release()
-            ep.counters["moves"] += 1
-            ep.budget.moves += 1
-            self._after_motion(ep)
-            exec_s = time.monotonic() - t_exec
-            doc = {"results": {k: results[k].to_dict() for k in JOINTS if k in results},
-                   "all_completed": all(r.status == COMPLETED for r in results.values()),
-                   "move_seconds": _r(exec_s, 2), "state_before": before, "state_after": self._state(),
-                   "budget": ep.budget.to_dict()}
-            self._note(results=doc["results"], move_seconds=doc["move_seconds"])
-            out: list = [_j(doc)]
-            if return_observation:
-                try:
-                    out += self._observe(ep, None)
-                except MotionRefused as e:
-                    out.append(_j({"observation_error": str(e)}))
-            return out
+                ep.counters["moves"] += 1
+                ep.budget.moves += 1
+                self._after_motion(ep)
+                exec_s = time.monotonic() - t_exec
+                doc = {"results": {k: results[k].to_dict() for k in JOINTS if k in results},
+                       "all_completed": all(r.status == COMPLETED for r in results.values()),
+                       "move_seconds": _r(exec_s, 2), "state_before": before, "state_after": self._state(),
+                       "budget": ep.budget.to_dict()}
+                self._note(results=doc["results"], move_seconds=doc["move_seconds"])
+                out: list = [_j(doc)]
+                if return_observation:
+                    try:
+                        out += self._observe(ep, None)
+                    except MotionRefused as e:
+                        out.append(_j({"observation_error": str(e)}))
+                return out
         return self.logged("move", args, body)
 
+    def _estop_message(self) -> str:
+        return (f"emergency_stop was called ({self._estop_reason!r}); motion stays refused until a person "
+                "has made the robot safe and restarted the server")
+
     def _check_motion_allowed(self, ep: Episode, command: dict[str, Any]) -> dict[str, float]:
+        if self._estop_reason is not None:
+            raise MotionRefused(self._estop_message())
         if ep.read_only:
             raise MotionRefused("server is in read-only mode: motion is disabled")
         ready = self.backend.readiness()
@@ -258,6 +288,10 @@ class AgentService:
     # ----------------------------------------------------------------- depth
     def get_gripper_depth(self, points: list, frame_id: int) -> list:
         def body() -> list:
+            with self._exclusive(wait=True):
+                return depth()
+
+        def depth() -> list:
             ep = self._require_active()
             if not isinstance(points, list) or not (1 <= len(points) <= MAX_DEPTH_POINTS):
                 raise MotionRefused(f"points must be a list of 1 to {MAX_DEPTH_POINTS} [x, y] pairs")
@@ -295,11 +329,14 @@ class AgentService:
     # ------------------------------------------------------------ e-stop
     def emergency_stop(self, reason: str) -> list:
         def body() -> list:
+            # Latch here too, not only in the backend: whether the real robot's runstop takes effect
+            # is unverified (README), and motion must not resume either way.
+            self._estop_reason = reason or "no reason given"
             self.backend.halt(f"agent emergency_stop: {reason}")   # deliberately lock-free
             if self.ep is not None:
                 self.ep.counters["emergency_stops"] += 1
             return [_j({"halted": True, "runstopped": self.backend.readiness().runstopped,
-                        "note": "motion is refused until a person clears the stop"})]
+                        "note": "motion is refused until a person has made the robot safe and restarted the server"})]
         return self.logged("emergency_stop", {"reason": reason}, body)
 
     def close(self) -> None:

@@ -2,7 +2,7 @@ import math
 
 import pytest
 
-from stretch4_agent.safety import Budget, SafetyConfig, validate_command
+from stretch4_agent.safety import DEFAULT_PER_MOVE, Budget, SafetyConfig, validate_command
 from stretch4_agent.schema import MotionRefused
 
 STATE = {"lift": 0.5, "arm": 0.1, "wrist_yaw": 0.0, "wrist_pitch": -45.0, "wrist_roll": 0.0, "gripper": 0.0}
@@ -89,3 +89,33 @@ def test_move_budget_and_time_budget():
     t[0] = 10.0
     with pytest.raises(MotionRefused, match="time budget"):
         b.check()
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), 0.0, -0.1, True, "0.1"])
+def test_a_cap_that_would_weaken_the_limit_is_refused(bad):
+    per_move = dict(DEFAULT_PER_MOVE, arm=bad)
+    with pytest.raises(ValueError, match="per-move cap for arm"):
+        SafetyConfig(per_move=per_move)
+
+
+def test_missing_or_unknown_caps_and_bad_budgets_are_refused():
+    with pytest.raises(ValueError, match="missing"):
+        SafetyConfig(per_move={k: v for k, v in DEFAULT_PER_MOVE.items() if k != "turn"})
+    with pytest.raises(ValueError, match="unknown per-move key 'arm_m'"):
+        SafetyConfig(per_move=dict(DEFAULT_PER_MOVE, arm_m=0.1))
+    for kw in ({"max_moves": 0}, {"max_seconds": float("nan")}, {"move_timeout": -1}):
+        with pytest.raises(ValueError):
+            SafetyConfig(**kw)
+
+
+def test_serve_refuses_a_nan_cap_cleanly(monkeypatch, capsys):
+    from stretch4_agent import cli
+    monkeypatch.setenv("STRETCH4_AGENT_TOKEN", "x")
+    assert cli.main(["serve", "--backend", "mock", "--max-arm", "nan"]) == 2
+    assert "per-move cap for arm" in capsys.readouterr().err
+
+
+def test_limits_without_a_state_value_refuse_instead_of_crashing():
+    state = {k: v for k, v in STATE.items() if k != "gripper"}
+    with pytest.raises(MotionRefused, match="no readable limits for gripper"):
+        validate_command({"gripper": 5.0}, state, LIMITS, CFG)

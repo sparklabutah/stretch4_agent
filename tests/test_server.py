@@ -160,7 +160,7 @@ async def test_emergency_stop_over_http_latches(live):
         r = await c.call_tool("emergency_stop", {"reason": "test"})
         assert not r.is_error and json.loads(r.content[0].text)["runstopped"] is True
         r = await c.call_tool("move", {"reasoning": "x", "arm_m": 0.01})
-        assert r.is_error and "runstopped" in r.content[0].text
+        assert r.is_error and "emergency_stop was called" in r.content[0].text
 
 
 async def test_client_with_wrong_token_cannot_connect(live):
@@ -253,3 +253,17 @@ def test_server_refuses_to_start_if_extras_stop_being_forbidden(svc, monkeypatch
     monkeypatch.setattr(ArgModelBase, "model_rebuild", classmethod(lambda cls, **kw: None))
     with pytest.raises(RuntimeError, match="would accept unknown arguments"):
         build_mcp(svc)
+
+
+async def test_move_numbers_are_strict_so_booleans_and_strings_never_become_motion(live):
+    """Pydantic's lax mode would turn `true` into 1.0 and "0.05" into 0.05 before the safety layer."""
+    service, url = live
+    async with client_for(url) as c:
+        await c.call_tool("start_episode", {"task": "t"})
+        before = service.backend.get_state()
+        for bad in ({"gripper_pct": True}, {"arm_m": "0.05"}, {"turn_deg": "5"}, {"arm_m": 0.01, "return_observation": "no"}):
+            r = await c.call_tool("move", {"reasoning": "x", **bad})
+            assert r.is_error, bad
+        assert service.backend.get_state() == before
+        r = await c.call_tool("move", {"reasoning": "ints are numbers", "turn_deg": 5, "return_observation": False})
+        assert not r.is_error, r.content[0].text

@@ -136,7 +136,7 @@ def test_emergency_stop_halts_a_running_move_and_latches(tmp_path):
     th.join(timeout=2)
     assert not th.is_alive()
     assert box["d"]["results"]["arm"]["status"] == "stopped_short"
-    with pytest.raises(MotionRefused, match="runstopped"):
+    with pytest.raises(MotionRefused, match="emergency_stop was called"):
         svc.move("r", {"arm": 0.01})
     assert svc.ep.counters["emergency_stops"] == 1
 
@@ -302,3 +302,62 @@ def test_start_episode_keys_move_arguments_by_their_unit_suffixed_names(svc):
     assert "units" not in info and "per_move_limits" not in info
     assert set(info["joint_limits"]) <= set(info["state_units"])
     assert set(info["state"]) == set(info["state_units"])
+
+
+# ---- review of service.py / safety.py (2026-11-02) ---------------------------------------
+
+def test_emergency_stop_latches_in_the_service_even_if_the_backend_does_not(started, monkeypatch):
+    """Whether the real robot's runstop takes effect is unverified; motion must stay refused anyway."""
+    monkeypatch.setattr(started.backend, "halt", lambda reason: None)      # a halt that latches nothing
+    started.emergency_stop("person too close")
+    assert started.backend.readiness().ok
+    with pytest.raises(MotionRefused, match="emergency_stop was called .*person too close"):
+        started.move("r", {"arm": 0.01})
+    info = json.loads(started.start_episode("again")[1])
+    assert info["ready_for_motion"] is False and any("emergency_stop" in p for p in info["readiness_problems"])
+    with pytest.raises(MotionRefused, match="emergency_stop was called"):
+        started.move("r", {"arm": 0.01})
+    started.observe()                                                       # looking and finishing still work
+    assert doc(started.finish_episode("blocked", "stopped for safety"))["finished"]
+
+
+def _run_slow_move(svc, box, **kw):
+    th = threading.Thread(target=lambda: box.update(d=doc(svc.move("r", {"arm": 0.1}, **kw))))
+    th.start()
+    time.sleep(0.2)
+    return th
+
+
+def test_observe_during_a_move_waits_and_shows_the_result(tmp_path):
+    svc = make_service(tmp_path, backend=MockBackend(size_scale=0.25, latency_s=1.0))
+    svc.start_episode("t")
+    box = {}
+    th = _run_slow_move(svc, box, return_observation=False)
+    head = doc(svc.observe())                      # sent mid-move: must wait, not show mid-motion images
+    th.join(timeout=3)
+    assert box["d"]["all_completed"]
+    assert head["state"]["arm"] == pytest.approx(box["d"]["state_after"]["arm"])
+    assert svc.ep.fresh_observation and svc.ep.current_frame_id == head["frame_id"]
+
+
+def test_finish_during_a_move_waits_and_then_needs_a_new_observation(tmp_path):
+    svc = make_service(tmp_path, backend=MockBackend(size_scale=0.25, latency_s=1.0))
+    svc.start_episode("t")
+    svc.observe()                                  # fresh before the move ...
+    box = {}
+    th = _run_slow_move(svc, box, return_observation=False)
+    with pytest.raises(MotionRefused, match="take an observation after your last move"):
+        svc.finish_episode("success", "it moved")  # ... but stale once the move it waited for ends
+    th.join(timeout=3)
+
+
+def test_a_second_move_during_a_move_is_refused_not_queued(tmp_path):
+    svc = make_service(tmp_path, backend=MockBackend(size_scale=0.25, latency_s=1.0))
+    svc.start_episode("t")
+    box = {}
+    th = _run_slow_move(svc, box, return_observation=False)
+    with pytest.raises(MotionRefused, match="still running"):
+        svc.move("r", {"arm": 0.05})
+    th.join(timeout=3)
+    assert svc.ep.counters["moves"] == 1
+    assert svc.backend.get_state()["arm"] == pytest.approx(0.2)

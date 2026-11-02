@@ -62,7 +62,9 @@ print to stdout, which corrupts an MCP stdio stream.
   downscaled gripper image the agent saw**; returns Euclidean depth in cm or null. At most 32
   calls between moves. A stale `frame_id` is an error, since the depth would not match the image.
 - `emergency_stop(reason)`: halts now. On the real robot this latches the runstop, and only a
-  human clears it. There is deliberately no tool to clear a runstop or to home.
+  human clears it. The service also latches it: motion stays refused until the server is
+  restarted, so a runstop that did not take effect cannot let motion resume. There is
+  deliberately no tool to clear a runstop or to home.
 - `finish_episode(outcome: "success"|"failure"|"blocked", evidence: str)`: rejected if no
   observation has been taken since the last motion. Ends motion until the next `start_episode`.
 
@@ -82,7 +84,14 @@ Defaults, overridable by serve flags only:
 - Per-move limits: drive/slide 0.30 m, turn 45 deg, lift 0.15 m, arm 0.15 m, wrist 45 deg.
 - Target joint limits checked before sending.
 - Budgets: 150 moves, 30 min per episode, per-move motion timeout 15 s.
-- Non-finite numbers rejected. Moves serialised with a lock.
+- Non-finite numbers rejected. Motion arguments are strict numbers: a boolean or a string is
+  rejected, not coerced (`true` would otherwise become 1.0).
+- One tool call at a time (except `emergency_stop`). A move sent while another call runs is
+  refused; `observe`, `get_gripper_depth`, `start_episode` and `finish_episode` wait for a running
+  move and then see its result. Limits are checked inside that lock, against the state the move
+  starts from.
+- Serve flags are validated: a cap or budget that is missing, non-finite or not positive stops
+  the server from starting (a NaN cap would otherwise disable the cap).
 - Real robot: refuses motion if not homed or runstopped. Never homes on its own.
 - `--read-only`: everything runs except motion, which is rejected and logged. For bring-up.
 - Motion timeout: halt, report `timeout`.

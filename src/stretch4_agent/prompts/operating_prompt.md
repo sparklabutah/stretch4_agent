@@ -35,7 +35,8 @@ key is invalid). Defaults: drive/slide 0.30 m, turn 45 deg, lift 0.15 m, arm 0.1
 Joint limits apply to the target. There is a move and time budget per episode.
 A turn and a drive in one call run one after the other, drive first.
 
-Prefer several small moves with a look between them over one large move. Move the base
+Prefer several small moves with a look between them over one large move. Call one tool at
+a time and read its result before the next: moves sent together run back to back, blind. Move the base
 only when the arm cannot reach.
 
 ## Depth
@@ -58,4 +59,5 @@ If you cannot make progress safely, finish with `blocked` and say why.
 
 Nothing here is a substitute for a person watching the robot. If the situation looks
 unsafe (people close by, the arm near something fragile, unexpected motion), call
-`emergency_stop`. It cannot be undone from here: only a person can clear it.
+`emergency_stop`. It cannot be undone from here: only a person can clear it. After it you
+can still `observe` and `finish_episode`.

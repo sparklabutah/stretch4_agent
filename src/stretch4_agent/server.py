@@ -97,19 +97,21 @@ def build_mcp(service: AgentService) -> MCPServer:
         """Images from the cameras (all by default: head_left, head_right, head_center, gripper) plus joint state and a frame_id."""
         return service.observe(cameras)
 
+    # strict=True: lax mode would turn `true` into 1.0 and "0.05" into 0.05 before the safety
+    # layer sees the value. Integers are still accepted as numbers.
     @mcp.tool(structured_output=False)
     @_refuse
     def move(reasoning: Annotated[str, Field(description="One sentence: why this move.")],
-             drive_m: Annotated[float, Field(description=PARAM_DOC["drive"])] = 0.0,
-             slide_m: Annotated[float, Field(description=PARAM_DOC["slide"])] = 0.0,
-             turn_deg: Annotated[float, Field(description=PARAM_DOC["turn"])] = 0.0,
-             lift_m: Annotated[float, Field(description=PARAM_DOC["lift"])] = 0.0,
-             arm_m: Annotated[float, Field(description=PARAM_DOC["arm"])] = 0.0,
-             wrist_yaw_deg: Annotated[float, Field(description=PARAM_DOC["wrist_yaw"])] = 0.0,
-             wrist_pitch_deg: Annotated[float, Field(description=PARAM_DOC["wrist_pitch"])] = 0.0,
-             wrist_roll_deg: Annotated[float, Field(description=PARAM_DOC["wrist_roll"])] = 0.0,
-             gripper_pct: Annotated[float, Field(description=PARAM_DOC["gripper"])] = 0.0,
-             return_observation: Annotated[bool, Field(description="Return a fresh observation after the move.")] = True) -> list:
+             drive_m: Annotated[float, Field(strict=True, description=PARAM_DOC["drive"])] = 0.0,
+             slide_m: Annotated[float, Field(strict=True, description=PARAM_DOC["slide"])] = 0.0,
+             turn_deg: Annotated[float, Field(strict=True, description=PARAM_DOC["turn"])] = 0.0,
+             lift_m: Annotated[float, Field(strict=True, description=PARAM_DOC["lift"])] = 0.0,
+             arm_m: Annotated[float, Field(strict=True, description=PARAM_DOC["arm"])] = 0.0,
+             wrist_yaw_deg: Annotated[float, Field(strict=True, description=PARAM_DOC["wrist_yaw"])] = 0.0,
+             wrist_pitch_deg: Annotated[float, Field(strict=True, description=PARAM_DOC["wrist_pitch"])] = 0.0,
+             wrist_roll_deg: Annotated[float, Field(strict=True, description=PARAM_DOC["wrist_roll"])] = 0.0,
+             gripper_pct: Annotated[float, Field(strict=True, description=PARAM_DOC["gripper"])] = 0.0,
+             return_observation: Annotated[bool, Field(strict=True, description="Return a fresh observation after the move.")] = True) -> list:
         """One relative move; every value is a delta from now, in the unit named by its suffix (_m metres, _deg degrees, _pct percent). Pass only the keys you need; omitted keys are 0. A key without its unit suffix (e.g. `arm`) or with another unit (e.g. `arm_cm`) is rejected. Blocks until done. Any invalid value or unknown key rejects the whole command and nothing moves. Returns per-joint results (completed / stopped_short / timeout / rejected) keyed by joint name (drive, arm, ...) and by default a fresh observation."""
         vals = dict(zip(JOINTS, (drive_m, slide_m, turn_deg, lift_m, arm_m, wrist_yaw_deg,
                                  wrist_pitch_deg, wrist_roll_deg, gripper_pct)))

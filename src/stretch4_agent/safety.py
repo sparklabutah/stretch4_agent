@@ -24,6 +24,21 @@ class SafetyConfig:
     move_timeout: float = 15.0
     read_only: bool = False
 
+    def __post_init__(self) -> None:
+        """Reject a configuration that would silently weaken a limit (a NaN cap compares False
+        with everything, so it would disable the cap)."""
+        def ok(v: Any) -> bool:
+            return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) and v > 0
+        problems = [f"per-move cap for {j} is missing" for j in JOINTS if j not in self.per_move]
+        problems += [f"unknown per-move key {k!r}" for k in self.per_move if k not in JOINTS]
+        problems += [f"per-move cap for {k} must be a finite number > 0, got {v!r}"
+                     for k, v in self.per_move.items() if k in JOINTS and not ok(v)]
+        problems += [f"{name} must be a finite number > 0, got {v!r}" for name, v in
+                     (("max_moves", self.max_moves), ("max_seconds", self.max_seconds),
+                      ("move_timeout", self.move_timeout)) if not ok(v)]
+        if problems:
+            raise ValueError("invalid safety configuration: " + "; ".join(problems))
+
 
 def validate_command(cmd: Mapping[str, Any], state: Mapping[str, float],
                      limits: Mapping[str, tuple[float, float]], cfg: SafetyConfig) -> dict[str, float]:
@@ -47,7 +62,7 @@ def validate_command(cmd: Mapping[str, Any], state: Mapping[str, float],
             errors.append(f"{PARAM[key]}: |{val:g}| exceeds the per-move limit {cap:g} {UNITS[key]}")
             continue
         if key in STATE_KEY and val != 0.0:
-            if key not in limits:
+            if key not in limits or key not in state:
                 errors.append(f"{PARAM[key]}: this robot has no readable limits for {key} (tool missing or limits unknown)")
                 continue
             lo, hi = limits[key]
