@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "stretch4-agent"
+version = "0.1.0"
+description = "MCP server that lets a coding agent drive a Hello Robot Stretch 4 through bounded relative moves"
+requires-python = ">=3.10"
+dependencies = [
+  "mcp>=2,<3",
+  "numpy",
+  "pillow",
+  "uvicorn",
+]
+
+[project.optional-dependencies]
+# Simulator backend. Also install stretch4_mujoco from a clone: `pip install -e path/to/stretch4_mujoco`
+# (see README).
+sim = ["mujoco", "opencv-python"]
+# Real-robot backend. Linux only, on the robot's NUC.
+robot = ["hello-robot-stretch4-body"]
+dev = ["pytest", "pytest-asyncio", "httpx"]
+
+[project.scripts]
+stretch4-agent = "stretch4_agent.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+stretch4_agent = ["prompts/*.md"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"

@@ -1,0 +1,9 @@
+# Applies only when Codex trusts this project. `stretch4-agent run --agent codex` passes the same
+# settings with -c so it does not depend on trust. The URL has no env expansion here: edit it for a
+# non-default port.
+[mcp_servers.stretch]
+url = "http://127.0.0.1:8765/mcp"
+bearer_token_env_var = "STRETCH4_AGENT_TOKEN"
+required = true
+tool_timeout_sec = 120
+default_tools_approval_mode = "approve"
