@@ -1,47 +1,86 @@
 # Handoff
 
-State as of 2026-11-01. Read `DESIGN.md` for settled decisions, `README.md` for usage and the
-hardware bring-up checklist. Implementation was stopped on request, so its final self-review
-never finished: treat the code as unreviewed.
+State as of 2026-11-02, branch `claude/bold-pasteur-f3wo40` (not merged). Read `DESIGN.md` for settled
+decisions, `README.md` for usage and the hardware bring-up checklist. The code has now had one review
+pass: the MCP argument handling and `backends/stretch.py` against the `stretch4_body` source. The rest
+(`service.py`, `safety.py`, `sim.py`, `mock.py`, `runner.py`) has not been reviewed line by line.
 
 ## What has been observed
 
 | Item | Result | Evidence |
 |---|---|---|
-| Unit and integration tests | 96 passed | `pytest`, mock backend and a fake `RobotClient` only |
-| `sim` backend, Mac, headless | Works when scripted | MCP session: 4 cameras returned rendered frames, 5 cm arm move achieved 4.97 cm, stale `frame_id` refused. Two of the frames were inspected by eye. No agent has driven the sim yet |
-| Claude Code 2.1.309, `--model haiku`, `mock` | Completed, 1 move, 4.3 s | Named the green and red cubes, which exist only in the images |
-| Codex 0.163, `gpt-6.1-sol`, `mock` | Completed, 1 move, 19.7 s | Named the same cubes; used `get_gripper_depth`; first `move` failed, see issue 1 |
-| `stretch` backend | Never run on hardware | Fake only |
+| Tests before any change (cloud Linux, Python 3.13.18, mcp 2.3.0) | 96 passed | `pytest`, matching the previous handoff |
+| Tests now | 106 passed | `pytest`, mock backend and a fake `RobotClient` only |
+| Issue 1 reproduced with an MCP client | `{"arm": 0.05, "reasoning": ...}` rejected, `{"arm_m": 0.05, ...}` accepted | Real `mcp.Client` over HTTP against the committed code; see below |
+| `sim` backend, headless Linux, no GPU | Works with Mesa software EGL | `doctor --backend sim` returned 4 camera shapes; served one agent episode |
+| Claude Code 2.1.316, `--model haiku`, `sim` | Completed, 1 move, 13.3 s, about $0.004 | `events.jsonl`: `start_episode`, `observe`, `move {"arm_m": 0.05}` (achieved 0.0494 m), `finish_episode`, no errors. I compared the saved head-centre images by eye: the gripper is further out after the move |
+| Claude Code 2.1.309, `--model haiku`, `mock` (Mac, earlier session) | Completed, 1 move, 4.3 s | Previous handoff; logs not in the repo |
+| Codex 0.163, `gpt-6.1-sol`, `mock` (Mac, earlier session) | Completed, 1 move, 19.7 s; first `move` rejected (issue 1) | Previous handoff; logs not in the repo |
+| Codex in this cloud session | Not run | No `codex` binary and no `~/.codex` here; not worked around |
+| `stretch` backend | Never run on hardware | Fake only, now corrected to the source's status shapes |
 
-Those run logs were in a temporary directory and are not in this repo. All `success` outcomes are
-the agent's own claims.
+All `success` outcomes are the agent's own claims. Run logs stay in `runs/` (gitignored), not in the repo.
+
+## Resolved this session
+
+1. **Issue 1, `move` rejected `{"arm": ...}`.** Reproduced with an MCP client. The strict-argument patch
+   was working: in the committed code the declared key is `arm_m`, not `arm`, and a subset of declared
+   keys (`{"arm_m": 0.05}`) was already accepted. The previous handoff's premise that `arm` was declared
+   did not match the code. *Assumed, not observed:* Codex used `arm` because the server showed it that
+   name everywhere else. `start_episode` keyed `units` and `per_move_limits` by `arm`, results and state
+   use `arm`, and the prompt listed the bare names next to the arguments. The Codex run's logs are gone,
+   so the schema it saw cannot be checked. Changes:
+   - every tool schema advertises `additionalProperties: false`;
+   - an unknown name is rejected before the call runs, naming the right key and its unit ("did you mean
+     'arm_m'? Its value is in metres"), and logged with `stage: "schema"`;
+   - the server refuses to start if an SDK change stops the private-attribute patch from forbidding
+     extras;
+   - `start_episode` returns `move_arguments` keyed by argument name (`arm_m: {unit, max_abs_per_move,
+     reported_as}`) and `state_units`; the old `units` and `per_move_limits` are gone.
+   Regression tests: a subset of declared keys passes; one unknown key rejects the whole call and nothing
+   moves; the exact Codex call gets the hint.
+2. **Issue 2, units in the schema.** The code already used suffixed names matching `DESIGN.md`. Each
+   `move` argument now also has a description stating its unit (degrees say "not radians"). The prompt,
+   `DESIGN.md`, `README.md` and tests agree, and a test checks every key's description.
+3. **`backends/stretch.py` review** against `hello-robot/stretch4_body` at 282e31c (2026-10-30). Fixed:
+   - `status[joint]['soft_motion_limits']` is a plain `[min, max]` list. The backend read `['current']`
+     from it, which raises `TypeError` in `start()`. The fake had the same wrong shape, so tests passed.
+     With a source-accurate fake the old backend fails 32 of 33 backend tests.
+   - Wrist limits now come from each joint's published `soft_motion_limits` (radians, padded), falling
+     back to `range_deg` minus `range_pad_deg`. Before, the padding was ignored.
+   - Only `stretch_gripper` is commandable as `gripper`. `parallel_gripper.move_by` takes aperture metres,
+     and the old code would have sent percent values to it as metres. State no longer falls back to the
+     gripper's radian `pos`.
+   - The gripper adapter's placeholder frame (black, `timestamp=0`) is skipped.
+   - Depth is resampled only for a pure scale difference; otherwise withheld.
+   Consistent with the source and unchanged: per-joint end-of-arm queue keys (`{joint}.end_of_arm`, so
+   wrist joints do not overwrite each other), `omnibase` translate/rotate overwrite, `push_command`'s
+   `sys.exit(1)`, OR over wheels for base motion, gripper percent passed through to
+   `StretchGripper.move_by(delta_pct)`, odometry integrated in the odom frame, depth aligned to the right
+   gripper imager. Added to the README's unverified list as items 15 to 18, including that
+   `RobotClient.stop()` (called on server close) leaves the base in **freewheel**.
 
 ## Open issues, in priority order
 
-1. **Rejected `move` from Codex, unexplained.** Codex sent `{"arm": 0.05, "reasoning": ...}` and got
-   `Extra inputs are not permitted` on `arm`. Resending with all nine keys succeeded. Sending a subset
-   of keys must work, and `arm` is a declared key, so this looks like a bug in the strict-argument
-   patch in `server.py`, which relies on a private `MCPServer` attribute. Reproduce with an MCP client
-   and add a regression test.
-2. **Parameter names differ from `DESIGN.md`.** Code uses `drive`, `arm`, `wrist_yaw`, `gripper`; the
-   design has `drive_m`, `arm_m`, `wrist_yaw_deg`, `gripper_pct`. Units must be unmistakable in the
-   tool schema, since a metres/degrees mix-up is a hardware risk. Either restore unit suffixes or
-   confirm the schema states units for every key, then update `DESIGN.md`.
-3. **Codex keeps `exec`, `apply_patch` and sub-agent tools**, per the model's self-report. The runner
+1. **Codex keeps `exec`, `apply_patch` and sub-agent tools**, per the model's self-report. The runner
    uses a read-only sandbox, but on real hardware run Codex as an unprivileged user or in a container.
-4. **Stretch's ZMQ ports 23114-23116 bind on all interfaces without authentication**
+2. **Stretch's ZMQ ports 23114-23116 bind on all interfaces without authentication**
    (`core/client_server.py` in `stretch4_body`). Anyone on the robot's network can send commands,
    independent of this project. Firewall them on the NUC.
+3. **No Codex run against `sim`**, and Claude has driven the sim once, with Haiku, on a one-move task.
+4. **`serve --backend sim` exits with code 1 on SIGINT.** The log shows a clean shutdown and no
+   traceback. Not investigated; harmless so far.
 
 ## Next steps
 
-1. Fix issues 1 and 2.
-2. Run Claude and Codex against `--backend sim` with a small task, keeping cost low.
-3. Review `src/stretch4_agent/backends/stretch.py` against the `stretch4_body` source.
-4. On the robot: follow the README bring-up checklist in order, from `doctor` and `--read-only`, with
-   a person at the runstop. Resolve every "Unverified until on hardware" item before a full episode.
-5. Reproduce GT-RAIL's ablation shape (reasoning effort, depth on/off) with Claude and Astra on the
+1. Run Codex against `--backend sim` on a machine where it is logged in. Watch for `stage: "schema"`
+   events in `events.jsonl` to see whether the new rejection message is enough.
+2. Review the rest of the code (`service.py`, `safety.py`, `sim.py`) the way `stretch.py` was reviewed.
+3. On the robot: follow the README bring-up checklist in order, from `doctor` and `--read-only`, with
+   a person at the runstop. `doctor` should now show `limits` for lift, arm and the wrists, and an empty
+   `unsupported_tool_joints` with the SG4 gripper. Resolve every "Unverified until on hardware" item
+   before a full episode.
+4. Reproduce GT-RAIL's ablation shape (reasoning effort, depth on/off) with Claude and Astra on the
    same tasks. No head-to-head has been run.
 
 ## Resume on any machine
@@ -60,8 +99,12 @@ cd stretch4_agent && python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"
 .venv/bin/pytest -q
 ```
 
-Expect 96 passed. For the simulator (needs Python 3.12 or newer; on headless Linux also
-`export MUJOCO_GL=egl`):
+Expect 106 passed. For the simulator (needs Python 3.12 or newer; on headless Linux also
+`export MUJOCO_GL=egl`, and without a GPU install Mesa's EGL first):
+
+```bash
+sudo apt-get install -y libegl1 libegl-mesa0 libgl1-mesa-dri
+```
 
 ```bash
 git clone --recurse-submodules https://github.com/hello-robot/stretch4_mujoco .deps/stretch4_mujoco
@@ -71,6 +114,13 @@ git clone --recurse-submodules https://github.com/hello-robot/stretch4_mujoco .d
 .venv/bin/pip install -e .deps/stretch4_mujoco -e ".[sim]"
 ```
 
+To review the robot backend, clone the SDK source next to it (not installed; Linux-only hardware
+libraries):
+
+```bash
+git clone https://github.com/hello-robot/stretch4_body .deps/stretch4_body
+```
+
 Start a server, then run an agent from a second shell:
 
 ```bash
@@ -78,7 +128,7 @@ Start a server, then run an agent from a second shell:
 ```
 
 ```bash
-STRETCH4_AGENT_TOKEN_FILE=.tokens/agent.token .venv/bin/stretch4-agent serve --backend mock
+STRETCH4_AGENT_TOKEN_FILE=.tokens/agent.token .venv/bin/stretch4-agent serve --backend sim
 ```
 
 ```bash
