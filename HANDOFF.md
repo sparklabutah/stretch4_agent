@@ -14,6 +14,8 @@ MCP argument handling (`server.py`), `backends/stretch.py` against the `stretch4
 | Issue 1 reproduced with an MCP client | `{"arm": 0.05, "reasoning": ...}` rejected, `{"arm_m": 0.05, ...}` accepted | Real `mcp.Client` over HTTP against the committed code; see below |
 | `sim` backend, headless Linux, no GPU | Works with Mesa software EGL | `doctor --backend sim` returned 4 camera shapes; served one agent episode |
 | Claude Code 2.1.316, `--model haiku`, `sim` | Completed, 1 move, 13.3 s, about $0.004 | `events.jsonl`: `start_episode`, `observe`, `move {"arm_m": 0.05}` (achieved 0.0494 m), `finish_episode`, no errors. I compared the saved head-centre images by eye: the gripper is further out after the move |
+| Claude Code 2.1.316, Opus 5.5 `--effort high`, `sim`, task A: find the ball, measure it, no contact | Completed, 12 moves, 2 depth calls, 135 s, $0.65 | Its last gripper image shows the ball fully in view with the queried pixel on it; reported 45.6 cm, tabletop behind it 59 cm (no ground truth for the absolute value). Two `stopped_short` (wrist pitch with `in_collision_stop`, wrist yaw at a limit), handled by changing approach. Sent two moves in one turn; Claude Code ran them back to back (second started 0.018 s after the first ended), so no overlap, but the second was blind. Model wait 72% of the episode |
+| Same, task B: pick up the ball and lift it 5 cm | **Not completed**: hit `--max-turns 45` without `finish_episode`, 33 moves, 10 depth calls, 613 s, $2.53 | Used every joint including base drive/slide/turn, wrist roll and gripper. Safety layer refused two moves (per-move cap; wrist-yaw joint limit) and it recovered. Its final images show the ball between the open fingers and the cup clear; the last two close commands stopped at -3.9% and 0%, so whether it is gripped is unknown. Model wait 84% |
 | Claude Code 2.1.309, `--model haiku`, `mock` (Mac, earlier session) | Completed, 1 move, 4.3 s | Previous handoff; logs not in the repo |
 | Codex 0.163, `gpt-6.1-sol`, `mock` (Mac, earlier session) | Completed, 1 move, 19.7 s; first `move` rejected (issue 1) | Previous handoff; logs not in the repo |
 | Codex in this cloud session | Not run | No `codex` binary and no `~/.codex` here; not worked around |
@@ -86,15 +88,21 @@ All `success` outcomes are the agent's own claims. Run logs stay in `runs/` (git
 2. **Stretch's ZMQ ports 23114-23116 bind on all interfaces without authentication**
    (`core/client_server.py` in `stretch4_body`). Anyone on the robot's network can send commands,
    independent of this project. Firewall them on the NUC.
-3. **No Codex run against `sim`**, and Claude has driven the sim once, with Haiku, on a one-move task.
-4. **`serve --backend sim` exits with code 1 on SIGINT.** The log shows a clean shutdown and no
+3. **No Codex run against `sim`.** Claude (Opus 5.5 high) found and measured an object but did not finish
+   a pick within 45 turns. Manipulation needs a larger `--max-turns` (try 80) and costs a few dollars per
+   episode at this effort.
+4. **An agent that runs out of turns leaves the episode active** (`episode.json` keeps `active: true`
+   until the next `start_episode` or server shutdown marks it abandoned). The robot simply stays still;
+   it only matters for log analysis.
+5. **`serve --backend sim` exits with code 1 on SIGINT.** The log shows a clean shutdown and no
    traceback. Not investigated; harmless so far.
 
 ## Next steps
 
-1. Run Codex against `--backend sim` on a machine where it is logged in. Watch for `stage: "schema"`
+1. Rerun the pick task with `--max-turns 80` to see whether Opus completes it, then run Codex against
+   `--backend sim` on a machine where it is logged in. Watch for `stage: "schema"`
    events in `events.jsonl` to see whether the new rejection message is enough.
-2. Review the rest of the code (`service.py`, `safety.py`, `sim.py`) the way `stretch.py` was reviewed.
+2. Review the rest of the code (`sim.py`, `runner.py`) the way `stretch.py` was reviewed.
 3. On the robot: follow the README bring-up checklist in order, from `doctor` and `--read-only`, with
    a person at the runstop. `doctor` should now show `limits` for lift, arm and the wrists, and an empty
    `unsupported_tool_joints` with the SG4 gripper. Resolve every "Unverified until on hardware" item
