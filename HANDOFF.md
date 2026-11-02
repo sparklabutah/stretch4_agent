@@ -1,16 +1,16 @@
 # Handoff
 
 State as of 2026-11-02, branch `claude/bold-pasteur-f3wo40` (not merged). Read `DESIGN.md` for settled
-decisions, `README.md` for usage and the hardware bring-up checklist. The code has now had one review
-pass: the MCP argument handling and `backends/stretch.py` against the `stretch4_body` source. The rest
-(`service.py`, `safety.py`, `sim.py`, `mock.py`, `runner.py`) has not been reviewed line by line.
+decisions, `README.md` for usage and the hardware bring-up checklist. Reviewed line by line so far: the
+MCP argument handling (`server.py`), `backends/stretch.py` against the `stretch4_body` source, and
+`service.py` and `safety.py`. Not reviewed: `sim.py`, `mock.py`, `runner.py`, `episode.py`.
 
 ## What has been observed
 
 | Item | Result | Evidence |
 |---|---|---|
 | Tests before any change (cloud Linux, Python 3.13.18, mcp 2.3.0) | 96 passed | `pytest`, matching the previous handoff |
-| Tests now | 106 passed | `pytest`, mock backend and a fake `RobotClient` only |
+| Tests now | 120 passed | `pytest`, mock backend and a fake `RobotClient` only |
 | Issue 1 reproduced with an MCP client | `{"arm": 0.05, "reasoning": ...}` rejected, `{"arm_m": 0.05, ...}` accepted | Real `mcp.Client` over HTTP against the committed code; see below |
 | `sim` backend, headless Linux, no GPU | Works with Mesa software EGL | `doctor --backend sim` returned 4 camera shapes; served one agent episode |
 | Claude Code 2.1.316, `--model haiku`, `sim` | Completed, 1 move, 13.3 s, about $0.004 | `events.jsonl`: `start_episode`, `observe`, `move {"arm_m": 0.05}` (achieved 0.0494 m), `finish_episode`, no errors. I compared the saved head-centre images by eye: the gripper is further out after the move |
@@ -59,6 +59,25 @@ All `success` outcomes are the agent's own claims. Run logs stay in `runs/` (git
    `StretchGripper.move_by(delta_pct)`, odometry integrated in the odom frame, depth aligned to the right
    gripper imager. Added to the README's unverified list as items 15 to 18, including that
    `RobotClient.stop()` (called on server close) leaves the base in **freewheel**.
+4. **`service.py` and `safety.py` review.** Fixed, each with a test that fails on the old code:
+   - Limits were checked before taking the move lock, so a move could be validated against a state
+     that changed before it started. Validation now happens inside the lock.
+   - `observe` (and depth, finish, start) could run beside a move and mark mid-motion images as the
+     fresh observation that `finish_episode` and depth queries rely on. Now one tool call runs at a
+     time (except `emergency_stop`): a second move is refused; the others wait for the move.
+   - Pydantic's lax mode turned `true` into 1.0 and `"0.05"` into 0.05 before the safety layer, so
+     its bool check never ran over MCP. Motion arguments are now strict (integers still accepted).
+   - `emergency_stop` now also latches in the service until the server restarts, so a runstop that
+     does not take effect on hardware (README unverified item 4) cannot let motion resume. Bring-up
+     step 5 and the README describe the restart. This changes recovery on the robot; revert it if a
+     restart is unacceptable.
+   - `SafetyConfig` accepted a NaN cap (which compares False and disables the cap), zero, negative or
+     missing caps and budgets. Now refused; `serve` exits with a config error.
+   - `validate_command` raised `KeyError` for a joint with limits but no state; now refuses it.
+   Read and judged fine: per-move caps before joint limits, whole-command rejection, zero-move
+   rejection, readiness, read-only and budget checks before every move, halt and reporting on a
+   backend exception, frame freshness after motion, depth pixel mapping, finish requiring a fresh
+   observation.
 
 ## Open issues, in priority order
 
@@ -99,7 +118,7 @@ cd stretch4_agent && python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"
 .venv/bin/pytest -q
 ```
 
-Expect 106 passed. For the simulator (needs Python 3.12 or newer; on headless Linux also
+Expect 120 passed. For the simulator (needs Python 3.12 or newer; on headless Linux also
 `export MUJOCO_GL=egl`, and without a GPU install Mesa's EGL first):
 
 ```bash
