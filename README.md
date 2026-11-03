@@ -83,27 +83,68 @@ extras if wanted), run `pytest`. Generate a fresh token; do not copy tokens or `
 repo contains an absolute path. Nothing about the server changes: run it with `--backend sim`, point
 the agent at it.
 
-## NUC deployment (real robot)
+## On the robot (everything on the NUC)
 
-Topology: `stretch_body_server` and the OAK cameras live on the robot's **NUC** (the Jetson is a GPU
-expansion). Camera generators open the devices in their own process, so the server must run on the
-NUC, next to `RobotClient`. The agent runs wherever you like and reaches the server through an SSH
-tunnel.
+`stretch_body_server` and the OAK cameras live on the robot's **NUC** (the Jetson is a GPU expansion), so
+the server runs there. The agent CLI runs there too: it only needs Wi-Fi to reach the model API. No SSH
+tunnel is needed. Run the agent as a **separate unprivileged user**, because Codex keeps a shell that could
+otherwise drive the robot directly and skip every limit (DESIGN.md, Topology).
+
+One-time setup, as the robot's normal user, from this repository on the NUC:
 
 ```bash
-# on the NUC, in the environment that has hello-robot-stretch4-body
-pip install -e ".[robot]"
-stretch_body_server --daemon                    # if not already running
-stretch4-agent token --file .tokens/agent.token
-STRETCH4_AGENT_TOKEN_FILE=.tokens/agent.token stretch4-agent serve --backend stretch --read-only
-
-# on the agent machine
-ssh -N -L 8765:127.0.0.1:8765 stretch
-export STRETCH4_AGENT_TOKEN=...                 # the same token
+pip install -e ".[robot]"            # in the environment that has hello-robot-stretch4-body
 ```
 
-The server binds `127.0.0.1` only and refuses another address without `--allow-remote-bind`. Do not use
-that flag; the tunnel is the intended way. Do not run the ROS driver or gamepad teleop while an agent
+Install the Codex CLI system-wide (so another user can run it), then create the agent user. The script
+removes it from the robot's groups, blocks TCP 23114-23116 for it, copies the client config to
+`/srv/stretch4-agent`, and lets you start only the agent CLIs as it:
+
+```bash
+sudo scripts/nuc/setup_agent_user.sh
+```
+
+```bash
+sudo apt install iptables-persistent && sudo netfilter-persistent save     # keep the rule after reboot
+```
+
+```bash
+sudo -u stretch-agent -H codex login                                        # its own Codex credentials
+```
+
+Every session (two shells, both as the robot's normal user):
+
+```bash
+stretch4-agent token --file .tokens/agent.token
+```
+
+```bash
+STRETCH4_AGENT_TOKEN_FILE=.tokens/agent.token stretch4-agent serve --backend stretch --read-only
+```
+
+With `stretch_body_server` and the server running, check the isolation. Every line must say PASS:
+
+```bash
+sudo -u stretch-agent -H python3 /srv/stretch4-agent/check_isolation.py
+```
+
+Then run the agent as that user:
+
+```bash
+export STRETCH4_AGENT_TOKEN="$(cat .tokens/agent.token)"
+```
+
+```bash
+stretch4-agent run --agent codex --run-as stretch-agent --project-dir /srv/stretch4-agent --task "Look around and describe what you see, then finish."
+```
+
+`--run-as` starts the CLI through `sudo -n -u stretch-agent` and passes only the token and the CLI's
+settings. Codex defaults to `gpt-6-astra` at effort `high`. The runner warns if Codex is started without
+`--run-as`. Claude Code has no shell here (`--tools ""`), but `--run-as` costs nothing for it either.
+
+The server binds `127.0.0.1` only and refuses another address without `--allow-remote-bind`; do not use
+that flag. To run the agent from another machine instead, use an SSH tunnel
+(`ssh -N -L 8765:127.0.0.1:8765 stretch`). Do not run the ROS driver or gamepad teleop while an agent
 drives: commands from a client without the control lease are dropped silently (`stretch_gamepad_teleop`
 outranks default clients by design; it is also the human override, along with the head runstop).
 
@@ -118,7 +159,9 @@ head runstop button for every stage after 1.
    `limits` has lift, arm and, if present, wrist and gripper (`limits_missing` should be empty or
    understood: a joint without a readable limit is refused, not guessed); camera shapes and measured fps for
    head and gripper streams running together; depth min/max and valid fraction.
-3. **Read-only episodes.** `serve --backend stretch --read-only`; run an agent episode. Check image
+3. **Read-only episodes.** First, the isolation check passes as `stretch-agent` (On the robot, above); do
+   not start Codex until every line says PASS, and re-check after any reboot or OS update.
+   `serve --backend stretch --read-only`; run an agent episode with `--run-as stretch-agent`. Check image
    orientation and left/right, `observe` after a hand-wave shows fresh frames, depth readings against a
    tape measure, and that `move` is rejected and logged.
 4. **One joint at a time**, restart without `--read-only` and with tiny caps
@@ -189,9 +232,10 @@ Added after reviewing against the `stretch4_body` source (commit 282e31c, 2026-1
   resource readers, plus the stretch tools through tool discovery. `--disable` removed web search, image
   generation, `view_image` and goals, but not `exec`, `apply_patch` or the sub-agent tools; no config key
   found removes them. The model's self-report of its tools is the only evidence here. The runner adds
-  `--sandbox read-only` and `--ignore-user-config` (otherwise the user's computer-use plugins load). If that
-  matters, run agents as an unprivileged user in a container. Claude Code is restricted to the MCP server
-  by `--tools ""` and `--allowedTools`.
+  `--sandbox read-only` and `--ignore-user-config` (otherwise the user's computer-use plugins load). On the
+  robot this is handled by running Codex as `stretch-agent` (`--run-as`), which cannot reach the robot except
+  through this server; the isolation check proves that per machine. That user can still use the network and
+  read the cameras. Claude Code is restricted to the MCP server by `--tools ""` and `--allowedTools`.
 - Single client, single episode at a time. `start_episode` abandons an active one.
 - `emergency_stop` latches in the server until it is restarted, on every backend, in addition to the real
   robot's runstop. There is no tool to clear either, by design.
@@ -205,6 +249,7 @@ Added after reviewing against the `stretch4_body` source (commit 282e31c, 2026-1
   the SDK's argument models, which are edited through a private attribute of `MCPServer`. The server checks
   at startup that every tool rejects an unknown argument and advertises `additionalProperties: false`, and
   refuses to start otherwise, so an SDK upgrade cannot silently re-allow extras. Tests cover both.
-- HTTP without TLS; the loopback bind plus SSH tunnel is the security model. Images are stored in `runs/`
+- HTTP without TLS; the loopback bind (agent on the same machine, or an SSH tunnel) plus the bearer token is
+  the security model. Images are stored in `runs/`
   and Claude Code also keeps copies under `~/.claude/projects/`.
 - The agent's `success` is a claim, never checked.

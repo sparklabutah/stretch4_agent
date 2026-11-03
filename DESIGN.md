@@ -11,17 +11,32 @@ Jetson Orin (`192.168.1.101`, user `jetson1`) is a GPU expansion on the internal
 NUC is `192.168.1.100` internally and on Wi-Fi externally.
 
 Cameras are not available through `RobotClient` (`stream_*` generators open DepthAI devices
-locally), so a remote `RobotClient` cannot see. Hence:
+locally), so a remote `RobotClient` cannot see. The server runs on the NUC. The agent CLI runs
+on the NUC too (it needs only Wi-Fi to reach the model API), as a separate unprivileged user:
 
 ```
-Claude Code / Codex  (Mac, workstation, or Jetson)
-        |  MCP over Streamable HTTP + bearer token, through an SSH tunnel
+Codex / Claude Code CLI      (on the NUC, as user stretch-agent; model API over Wi-Fi)
+        |  MCP over Streamable HTTP + bearer token, 127.0.0.1:8765
         v
-stretch4-agent serve --backend stretch        (on the NUC, 127.0.0.1:8765)
+stretch4-agent serve --backend stretch        (on the NUC, as the robot's normal user)
         |  RobotClient over local IPC     |  camera generators in threads
         v                                 v
 stretch_body_server (100 Hz, guards)     OAK cameras
 ```
+
+Why a separate user: Codex keeps a shell (`exec`) that no config key removes, and on the NUC
+that shell could reach `stretch_body_server` directly, skipping every limit below. Clients reach
+it through IPC sockets in `/tmp/stretch_zmq` (a 2770 directory of group `users`), TCP
+23114-23116 on all interfaces, or the USB devices (group `plugdev`, serial ports `dialout`).
+`scripts/nuc/setup_agent_user.sh` creates `stretch-agent` outside those groups, blocks those TCP
+ports for its UID with a firewall rule, and allows the robot user to start only the agent CLIs
+as it (`stretch4-agent run --run-as stretch-agent`). `stretch4_agent/isolation.py` (copied as
+`check_isolation.py`) verifies all of it from the agent user's side; it must pass before Codex
+drives the robot. The agent could still read the cameras (Luxonis udev rules are often 0666);
+that is a privacy matter, not a motion one.
+
+Running the agent on another machine through an SSH tunnel
+(`ssh -N -L 8765:127.0.0.1:8765 stretch`) also works and needs no code change.
 
 Same code with `--backend sim` or `--backend mock` runs anywhere. There is exactly one
 transport (HTTP) everywhere. No stdio: `RobotClient`, MuJoCo child processes and libraries
@@ -98,8 +113,8 @@ Defaults, overridable by serve flags only:
 
 Network: always require a bearer token (`STRETCH4_AGENT_TOKEN`, constant-time compare, refuse
 to start if unset). Default bind `127.0.0.1`. Refuse a non-loopback bind unless
-`--allow-remote-bind` is passed. Remote access is an SSH tunnel:
-`ssh -N -L 8765:127.0.0.1:8765 stretch`.
+`--allow-remote-bind` is passed. The agent runs on the same machine; from elsewhere, use an SSH
+tunnel: `ssh -N -L 8765:127.0.0.1:8765 stretch`.
 
 Human override stays physical: head runstop button, and `stretch_gamepad_teleop` outranks
 default clients by lease priority.

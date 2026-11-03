@@ -16,6 +16,8 @@ its safety limits whatever you ask for. If anything looks unsafe, call `emergenc
   (`from mcp.server.mcpserver import MCPServer`; there is no FastMCP).
 - Layout: `service.py` is the tool logic, `server.py` the HTTP/auth wrapper, `safety.py` the limits,
   `backends/` the three robots (`mock`, `sim`, `stretch`).
+- On the robot, agent CLIs run as `stretch-agent` (`scripts/nuc/setup_agent_user.sh`, `--run-as`), checked by
+  `isolation.py`. Do not weaken that user's isolation; Codex keeps a shell.
 - The safety layer lives server-side and must not become agent-configurable. Do not add a velocity
   tool, a tool that clears a runstop, or one that homes.
 - `backends/stretch.py` has only ever run against the fake in `tests/fakes.py`. Do not describe

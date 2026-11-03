@@ -35,8 +35,19 @@ def _prompt(task: str) -> str:
 
 
 def build_command(agent: str, task: str, *, url: str, model: str | None = None, effort: str | None = None,
-                  max_turns: int = 40, project_dir: Path = Path(".")) -> CommandSpec:
-    project_dir = Path(project_dir)
+                  max_turns: int = 40, project_dir: Path = Path("."), run_as: str | None = None) -> CommandSpec:
+    """`run_as`: start the CLI as that (unprivileged) user through `sudo -n`, passing only the
+    token and the CLI's settings. Needed for Codex on the robot's own computer, where its shell
+    could otherwise reach stretch_body_server directly (scripts/nuc/setup_agent_user.sh)."""
+    spec = _build(agent, task, url=url, model=model, effort=effort, max_turns=max_turns, project_dir=Path(project_dir))
+    if run_as:
+        keep = ",".join([TOKEN_ENV, *spec.env])
+        spec.argv = ["sudo", "-n", "-u", run_as, "-H", f"--preserve-env={keep}", "--", *spec.argv]
+    return spec
+
+
+def _build(agent: str, task: str, *, url: str, model: str | None, effort: str | None,
+           max_turns: int, project_dir: Path) -> CommandSpec:
     prompt = _prompt(task)
     if agent == "claude":
         argv = [_binary("claude"), "-p", prompt,

@@ -90,8 +90,12 @@ def cmd_run(args) -> int:
     except ConfigError as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
+    if args.agent == "codex" and not args.run_as:
+        print("warning: Codex keeps a shell. On the robot's own computer run it with --run-as and the user "
+              "made by scripts/nuc/setup_agent_user.sh, or that shell can reach the robot directly.",
+              file=sys.stderr)
     spec = build_command(args.agent, args.task, url=args.url, model=args.model, effort=args.effort,
-                         max_turns=args.max_turns, project_dir=Path(args.project_dir))
+                         max_turns=args.max_turns, project_dir=Path(args.project_dir), run_as=args.run_as)
     if args.dry_run:
         print(json.dumps({"argv": spec.argv, "extra_env": {k: v for k, v in spec.env.items()}}, indent=2))
         return 0
@@ -139,6 +143,8 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--effort")
     r.add_argument("--max-turns", type=int, default=40)
     r.add_argument("--project-dir", default=".")
+    r.add_argument("--run-as", metavar="USER", help="start the agent CLI as this unprivileged user via sudo -n "
+                   "(on the robot: the user from scripts/nuc/setup_agent_user.sh)")
     r.add_argument("--dry-run", action="store_true", help="print the command instead of running it")
     r.set_defaults(fn=cmd_run)
 
